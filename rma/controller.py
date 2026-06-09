@@ -1,0 +1,185 @@
+"""RMA deployment Controller for the gym-quadruped Project-3 benchmark.
+
+Implements the required interface:
+
+    class Controller:
+        def reset(self, seed=None): ...
+        def act(self, observation): return action, info
+
+The controller wraps the two RMA networks trained in MJX:
+  * base policy pi  (Phase 1) -- runs every control step,
+  * adaptation module phi (Phase 2) -- refreshes the extrinsics estimate z_hat
+    asynchronously (every ``async_every`` steps, ~10 Hz), exactly as in the RMA
+    deployment loop.
+
+It consumes ONLY observations the proprioceptive benchmark exposes:
+    gravity_vector:base (3), imu_gyro (3), qpos_js (12), qvel_js (12),
+    base_lin_vel_err:base (3), base_ang_vel_err:base (3).
+These are assembled into the same 36-d state ``x_t`` used during training, in
+the same joint order (qpos order: FL, FR, RL, RR).
+
+The policy outputs a residual joint-position target ``a``; we convert it to a
+joint torque with a fixed PD law (matching the MJX env), then permute the torque
+into the actuator/ctrl order gym-quadruped applies (FR, FL, RR, RL).
+"""
+from __future__ import annotations
+
+import numpy as np
+import jax
+import jax.numpy as jnp
+
+from .config import Config
+from .models import networks
+from .envs.go2_constants import NOMINAL_POSE, TORQUE_LIMIT
+from .utils import load_pytree
+
+
+# qpos order (FL,FR,RL,RR) -> ctrl order (FR,FL,RR,RL). tau_ctrl = tau_qpos[perm].
+CTRL_FROM_QPOS = np.array([3, 4, 5, 0, 1, 2, 9, 10, 11, 6, 7, 8], dtype=np.int32)
+
+# Observation keys consumed from the benchmark dict (proprioceptive variant).
+OBS_KEYS = (
+    "gravity_vector:base",
+    "imu_gyro",
+    "qpos_js",
+    "qvel_js",
+    "base_lin_vel_err:base",
+    "base_ang_vel_err:base",
+)
+
+
+class Controller:
+    def __init__(
+        self,
+        phase1_ckpt: str = "checkpoints/phase1_final.pkl",
+        phase2_ckpt: str | None = "checkpoints/phase2_final.pkl",
+        cfg: Config | None = None,
+        kp: float = 30.0,
+        kd: float = 0.7,
+        async_every: int = 10,
+        control_decimation: int | None = None,
+        mode: str = "rma",
+    ):
+        """Args:
+        phase1_ckpt: base-policy + encoder params.
+        phase2_ckpt: adaptation-module params (required for mode='rma').
+        kp, kd: PD gains used to turn the residual position target into torque.
+        async_every: refresh z_hat every this many *policy* updates (~10 Hz).
+        control_decimation: env steps per policy update. gym-quadruped steps at
+            500 Hz; the policy was trained at 50 Hz, so the default (from cfg)
+            holds each residual target for 10 env steps while the PD torque is
+            recomputed every step. Set to 1 if you call act() at the policy rate.
+        mode: 'rma' (phi estimates z_hat), or 'no_adapt' (z = mu(0)).
+        """
+        self.cfg = cfg or Config()
+        self.kp = float(kp)
+        self.kd = float(kd)
+        self.async_every = int(async_every)
+        self.decimation = int(control_decimation if control_decimation is not None
+                              else self.cfg.env.control_decimation)
+        self.mode = mode
+
+        self.nominal = np.asarray(NOMINAL_POSE, dtype=np.float32)
+        self.tau_limit = np.asarray(TORQUE_LIMIT, dtype=np.float32)
+        self.action_scale = self.cfg.env.action_scale
+        self.k = self.cfg.env.history_len
+        self.row_dim = self.cfg.net.state_dim + self.cfg.net.action_dim
+
+        encoder, policy, _, adapt = networks.build_networks(self.cfg)
+        p1 = load_pytree(phase1_ckpt)
+        self._enc_params = p1["encoder"]
+        self._pol_params = p1["policy"]
+
+        if mode == "rma":
+            if not phase2_ckpt:
+                raise ValueError("mode='rma' requires a phase2 checkpoint")
+            self._phi_params = load_pytree(phase2_ckpt)
+
+            @jax.jit
+            def _phi(history):
+                return adapt.apply(self._phi_params, history)
+
+            self._phi = _phi
+        else:  # no_adapt: z = mu(0)
+            zero_e = jnp.zeros((self.cfg.net.env_factor_dim,))
+            self._z_fixed = np.asarray(encoder.apply(self._enc_params, zero_e))
+
+        @jax.jit
+        def _policy_mean(x, a_prev, z):
+            mean, _ = policy.apply(self._pol_params, x, a_prev, z)
+            return mean
+
+        self._policy_mean = _policy_mean
+
+        self.reset()
+
+    # ------------------------------------------------------------------ reset
+    def reset(self, seed=None):
+        self._history = None                 # lazily filled on first act
+        self._prev_action = np.zeros(self.cfg.net.action_dim, dtype=np.float32)
+        self._target_q = self.nominal.copy()  # PD setpoint (qpos order)
+        self._z_async = None
+        self._step = 0                        # env-step counter
+        self._policy_updates = 0
+
+    # ------------------------------------------------------------------- act
+    def _build_x(self, obs: dict) -> np.ndarray:
+        for key in OBS_KEYS:
+            if key not in obs:
+                raise KeyError(
+                    f"observation missing '{key}'. The benchmark must expose the "
+                    f"proprioceptive obs set: {OBS_KEYS}")
+        x = np.concatenate([
+            np.asarray(obs["gravity_vector:base"], dtype=np.float32),
+            np.asarray(obs["imu_gyro"], dtype=np.float32),
+            np.asarray(obs["qpos_js"], dtype=np.float32),
+            np.asarray(obs["qvel_js"], dtype=np.float32),
+            np.asarray(obs["base_lin_vel_err:base"], dtype=np.float32),
+            np.asarray(obs["base_ang_vel_err:base"], dtype=np.float32),
+        ])
+        assert x.shape[0] == self.cfg.net.state_dim, (
+            f"assembled state dim {x.shape[0]} != {self.cfg.net.state_dim}")
+        return x
+
+    def act(self, observation):
+        qpos_js = np.asarray(observation["qpos_js"], dtype=np.float32)
+        qvel_js = np.asarray(observation["qvel_js"], dtype=np.float32)
+
+        # --- policy + adaptation update (every `decimation` env steps) ------
+        if self._step % self.decimation == 0:
+            x = self._build_x(observation)
+
+            # history row pairs the resulting obs with the action that caused it
+            row = np.concatenate([x, self._prev_action])
+            if self._history is None:
+                self._history = np.tile(row, (self.k, 1)).astype(np.float32)
+            else:
+                self._history = np.roll(self._history, -1, axis=0)
+                self._history[-1] = row
+
+            if self.mode == "rma":
+                if (self._z_async is None
+                        or self._policy_updates % self.async_every == 0):
+                    self._z_async = np.asarray(
+                        self._phi(jnp.asarray(self._history)))
+                z = self._z_async
+            else:
+                z = self._z_fixed
+
+            a = np.asarray(self._policy_mean(
+                jnp.asarray(x), jnp.asarray(self._prev_action), jnp.asarray(z)))
+            self._target_q = self.nominal + self.action_scale * a
+            self._prev_action = a
+            self._policy_updates += 1
+
+        # --- PD -> torque (recomputed every env step, qpos order) -----------
+        tau = self.kp * (self._target_q - qpos_js) - self.kd * qvel_js
+        tau = np.clip(tau, -self.tau_limit, self.tau_limit)
+
+        # --- permute to actuator / ctrl order -------------------------------
+        action = tau[CTRL_FROM_QPOS].astype(np.float32)
+
+        self._step += 1
+        info = {"z_hat": (self._z_async if self.mode == "rma" else self._z_fixed),
+                "residual_action": self._prev_action}
+        return action, info

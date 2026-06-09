@@ -1,0 +1,21 @@
+# --- RMA training (MJX / JAX, GPU) -----------------------------------------
+# Install jax with CUDA on the GPU host (see Dockerfile):
+#   pip install -U "jax[cuda12]"
+jax>=0.4.34
+jaxlib>=0.4.34
+mujoco>=3.2.0          # MjSpec editing API + CPU MuJoCo
+mujoco-mjx>=3.2.0      # MJX (GPU) physics backend used for training
+flax>=0.8.0
+optax>=0.2.0
+numpy>=1.26
+
+# --- Project-3 benchmark (CPU) ---------------------------------------------
+# gym-quadruped supplies the Go2 QuadrupedEnv used for grading / eval_gym.
+gym-quadruped>=1.1.2
+gymnasium>=1.0
+scipy>=1.11
+matplotlib>=3.7        # imported by gym_quadruped's IMU sensor
+
+# --- Optional: rendering / video of deployment rollouts --------------------
+imageio>=2.34
+imageio-ffmpeg>=0.4
