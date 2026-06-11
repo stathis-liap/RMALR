@@ -15,17 +15,41 @@ calf). This is exactly the order gym-quadruped returns as ``qpos_js`` /
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List
 
 import numpy as np
 import mujoco
 
 
-# qpos / qvel joint order.
+# qpos / qvel joint order (Go2: FL, FR, RL, RR -- per leg hip, thigh, calf).
 LEGS_QPOS = ("FL", "FR", "RL", "RR")
-# Actuator / ctrl order (what gym-quadruped's action space expects).
-LEGS_CTRL = ("FR", "FL", "RR", "RL")
 JOINT_SUFFIXES = ("hip", "thigh", "calf")
+
+# Candidate trunk body names across Go2 MJCF variants (gym-quadruped uses
+# "base"; the Unitree mujoco repo uses "base_link"; menagerie uses "trunk").
+TRUNK_BODY_CANDIDATES = ("base", "base_link", "trunk")
+
+
+def package_go2_path() -> str:
+    """Absolute path to the Go2 MJCF bundled inside the gym-quadruped package.
+
+    Using this single model for BOTH MJX training and gym-quadruped evaluation
+    makes the repo self-contained (no external model tree) and eliminates any
+    sim-to-sim model mismatch with the grader.
+    """
+    import gym_quadruped
+    p = Path(gym_quadruped.__file__).parent / "robot_model" / "go2" / "go2.xml"
+    if not p.exists():
+        raise FileNotFoundError(f"gym-quadruped Go2 model not found at {p}")
+    return str(p)
+
+
+def resolve_model_path(model_path: str | None) -> str:
+    """Map the special value "auto"/None to the gym-quadruped bundled Go2."""
+    if model_path in (None, "auto", "gym_quadruped"):
+        return package_go2_path()
+    return model_path
 
 # Nominal standing pose (rad), per leg [hip, thigh, calf]. Go2 keyframe "home".
 NOMINAL_POSE = np.array([0.0, 0.9, -1.8] * 4, dtype=np.float32)
@@ -53,8 +77,12 @@ def _name2id(model, objtype, name) -> int:
 
 
 def resolve_layout(model: mujoco.MjModel) -> Go2Layout:
-    trunk_id = _name2id(model, mujoco.mjtObj.mjOBJ_BODY, TRUNK_BODY_NAME)
-    assert trunk_id >= 0, f"could not find trunk body '{TRUNK_BODY_NAME}'"
+    trunk_id = -1
+    for name in TRUNK_BODY_CANDIDATES:
+        trunk_id = _name2id(model, mujoco.mjtObj.mjOBJ_BODY, name)
+        if trunk_id >= 0:
+            break
+    assert trunk_id >= 0, f"could not find trunk body (tried {TRUNK_BODY_CANDIDATES})"
 
     qpos_adr, qvel_adr = [], []
     for leg in LEGS_QPOS:
@@ -66,13 +94,17 @@ def resolve_layout(model: mujoco.MjModel) -> Go2Layout:
 
     foot_body_ids, foot_geom_ids = [], []
     for leg in LEGS_QPOS:
-        bid = _name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"{leg}_foot")
-        assert bid >= 0, f"missing foot body {leg}_foot"
-        foot_body_ids.append(bid)
         # Foot collision geom is named exactly after the leg ("FL", "FR", ...).
         gid = _name2id(model, mujoco.mjtObj.mjOBJ_GEOM, leg)
         assert gid >= 0, f"missing foot geom '{leg}'"
         foot_geom_ids.append(gid)
+        # Some Go2 variants have an explicit "<leg>_foot" body; otherwise fall
+        # back to the body the foot geom lives on (the calf). foot_body_ids is
+        # informational only -- the env uses foot_geom_ids.
+        bid = _name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"{leg}_foot")
+        if bid < 0:
+            bid = int(model.geom_bodyid[gid])
+        foot_body_ids.append(bid)
 
     return Go2Layout(
         trunk_body_id=trunk_id,

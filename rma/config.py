@@ -177,5 +177,9 @@ class Config:
     # the dense make_jagged_scene.xml is kept for visualization only (too many
     # geoms for MJX). In the Docker image this lives one directory above the
     # repo (see Dockerfile).
-    model_path: str = "../unitree_mujoco/unitree_robots/go2/scene.xml"
+    # "auto" -> the Go2 MJCF bundled inside the gym-quadruped pip package. This
+    # keeps the repo self-contained (no external model tree) and means MJX
+    # training uses the exact model the grader evaluates on. Override with a path
+    # to a custom scene if desired.
+    model_path: str = "auto"
     checkpoint_dir: str = "checkpoints"

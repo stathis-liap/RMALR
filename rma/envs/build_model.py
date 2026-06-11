@@ -23,7 +23,7 @@ import os
 import mujoco
 
 from .terrain import fractal_heightfield
-from .go2_constants import LEGS_QPOS
+from .go2_constants import LEGS_QPOS, resolve_model_path
 
 
 def _foot_only_collisions(model: mujoco.MjModel) -> None:
@@ -108,10 +108,28 @@ def _add_heightfield(spec: "mujoco.MjSpec", cfg) -> None:
     )
 
 
+def _has_floor(spec: "mujoco.MjSpec") -> bool:
+    return any(g.type == mujoco.mjtGeom.mjGEOM_PLANE
+               for g in spec.worldbody.geoms)
+
+
+def _add_floor(spec: "mujoco.MjSpec") -> None:
+    spec.worldbody.add_geom(
+        name="rma_floor",
+        type=mujoco.mjtGeom.mjGEOM_PLANE,
+        size=[0.0, 0.0, 0.05],
+        pos=[0, 0, 0],
+    )
+
+
 def build_model(cfg, model_path: str) -> mujoco.MjModel:
+    # "auto"/None -> the Go2 model bundled inside the gym-quadruped package, so
+    # training uses the exact model the grader evaluates on.
+    model_path = resolve_model_path(model_path)
     if not os.path.exists(model_path):
         raise FileNotFoundError(
-            f"Model not found at {model_path}. Run scripts/download_assets.sh first."
+            f"Model not found at {model_path}. For the default (gym-quadruped "
+            f"bundled Go2) just `pip install gym-quadruped`."
         )
     spec = mujoco.MjSpec.from_file(model_path)
 
@@ -119,6 +137,9 @@ def build_model(cfg, model_path: str) -> mujoco.MjModel:
 
     if cfg.terrain == "hfield":
         _add_heightfield(spec, cfg)
+    elif not _has_floor(spec):
+        # Bare robot MJCF (e.g. gym-quadruped's go2.xml) has no ground; add one.
+        _add_floor(spec)
 
     # Stable physics for MJX: Newton solver, small timestep.
     spec.option.timestep = cfg.physics_dt

@@ -28,14 +28,25 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
+import mujoco
+
 from .config import Config
 from .models import networks
-from .envs.go2_constants import NOMINAL_POSE, TORQUE_LIMIT
+from .envs.go2_constants import (
+    NOMINAL_POSE, TORQUE_LIMIT, ctrl_from_qpos_permutation, resolve_model_path,
+)
 from .utils import load_pytree
 
 
-# qpos order (FL,FR,RL,RR) -> ctrl order (FR,FL,RR,RL). tau_ctrl = tau_qpos[perm].
-CTRL_FROM_QPOS = np.array([3, 4, 5, 0, 1, 2, 9, 10, 11, 6, 7, 8], dtype=np.int32)
+def _ctrl_permutation(model_path):
+    """Permutation mapping a qpos-ordered torque vector to the env's ctrl order.
+
+    Derived from the *evaluation* model so it is correct regardless of how the
+    Go2 MJCF orders its actuators (gym-quadruped's bundled model is identity;
+    the Unitree mujoco model is FR,FL,RR,RL). tau_ctrl = tau_qpos[perm].
+    """
+    m = mujoco.MjModel.from_xml_path(resolve_model_path(model_path))
+    return ctrl_from_qpos_permutation(m)
 
 # Observation keys consumed from the benchmark dict (proprioceptive variant).
 OBS_KEYS = (
@@ -81,6 +92,9 @@ class Controller:
 
         self.nominal = np.asarray(NOMINAL_POSE, dtype=np.float32)
         self.tau_limit = np.asarray(TORQUE_LIMIT, dtype=np.float32)
+        # ctrl-order permutation derived from the evaluation model (identity for
+        # the gym-quadruped bundled Go2).
+        self._perm = _ctrl_permutation(self.cfg.model_path)
         self.action_scale = self.cfg.env.action_scale
         self.k = self.cfg.env.history_len
         self.row_dim = self.cfg.net.state_dim + self.cfg.net.action_dim
@@ -177,7 +191,7 @@ class Controller:
         tau = np.clip(tau, -self.tau_limit, self.tau_limit)
 
         # --- permute to actuator / ctrl order -------------------------------
-        action = tau[CTRL_FROM_QPOS].astype(np.float32)
+        action = tau[self._perm].astype(np.float32)
 
         self._step += 1
         info = {"z_hat": (self._z_async if self.mode == "rma" else self._z_fixed),

@@ -1,21 +1,22 @@
 # RMA on MuJoCo/MJX for the Go2 velocity-tracking benchmark (Project 3).
 #
-# Build:  docker build -t rma-go2 .
+# This image is fully self-contained: both MJX training and the gym-quadruped
+# evaluation use the Go2 model that ships inside the gym-quadruped pip package
+# (rma/config.py: model_path="auto"). No external model tree or mount is needed.
 #
-# TRAINING loads the base Go2 scene (robot + plane) and injects a procedural
-# MJX heightfield (terrain="hfield" in rma/config.py). That base scene lives one
-# directory above the repo at ../unitree_mujoco/unitree_robots/go2/scene.xml.
-# Mount the model tree so it resolves to /unitree_mujoco (the parent of /app):
+# Build:
+#   docker build -t rma-go2 .
 #
-#   docker run --gpus all -it --rm \
-#       -v $PWD/checkpoints:/app/checkpoints \
-#       -v $(realpath ../unitree_mujoco):/unitree_mujoco \
-#       rma-go2 python -m rma.train_phase1 --envs 4096
+# Train (persist checkpoints to the host):
+#   docker run --gpus all -it --rm -v $PWD/checkpoints:/app/checkpoints rma-go2 \
+#       python -m rma.train_phase1
+#   docker run --gpus all -it --rm -v $PWD/checkpoints:/app/checkpoints rma-go2 \
+#       python -m rma.train_phase2 --phase1 checkpoints/phase1_final.pkl
 #
-# Evaluation in the official gym-quadruped benchmark uses the bundled Go2 model
-# (CPU MuJoCo), no mount required:
+# Evaluate in the gym-quadruped benchmark (CPU is fine for eval):
 #   docker run -it --rm -v $PWD/checkpoints:/app/checkpoints rma-go2 \
-#       python -m rma.eval_gym --episodes 20
+#       python -m rma.eval_gym --phase1 checkpoints/phase1_final.pkl \
+#                              --phase2 checkpoints/phase2_final.pkl --episodes 20
 #
 # Base: CUDA 12 + cuDNN runtime on Ubuntu 22.04 (matches jax[cuda12] wheels).
 FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
@@ -36,21 +37,21 @@ RUN ln -sf /usr/bin/python3.10 /usr/bin/python && python -m pip install --upgrad
 
 WORKDIR /app
 
-# JAX with CUDA 12 (pulls matching jaxlib). Pin if you need reproducibility.
+# JAX with CUDA 12 first (pulls matching jaxlib); the rest must not downgrade it.
 RUN pip install "jax[cuda12]>=0.4.34"
 
 COPY requirements.txt .
-# jax/jaxlib already installed above; install the rest (incl. gym-quadruped).
+# Install everything else (incl. gym-quadruped, which bundles the Go2 model).
 RUN pip install mujoco>=3.2.0 mujoco-mjx>=3.2.0 flax>=0.8.0 optax>=0.2.0 numpy>=1.26 \
                 "gym-quadruped>=1.1.2" "gymnasium>=1.0" scipy>=1.11 matplotlib>=3.7 \
                 imageio>=2.34 imageio-ffmpeg>=0.4
 
 COPY . .
 
-# Regenerate the jagged Go2 scene if the model tree is mounted at build time.
-# (Usually you mount ../unitree_mujoco at run time instead -- see header.)
-RUN python tools/make_jagged_scene.py \
-        --out ../unitree_mujoco/unitree_robots/go2/scene_jagged.xml \
-    || echo "go2 model tree not present at build; mount it at run time"
+# Sanity-check at build time that the model + networks wire up (fails the build
+# early if a dependency is missing). Does not need a GPU.
+RUN python -c "from rma.config import Config; from rma.envs.build_model import build_model; \
+m=build_model(Config().env, Config().model_path); print('build OK:', m.ngeom, 'geoms')"
 
-CMD ["python", "-m", "rma.train_phase1", "--envs", "4096"]
+# Default: launch Phase-1 training. Override with eval_gym / train_phase2 as above.
+CMD ["python", "-m", "rma.train_phase1"]
