@@ -40,6 +40,16 @@ WORKDIR /app
 # JAX with CUDA 12 first (pulls matching jaxlib); the rest must not downgrade it.
 RUN pip install "jax[cuda12]>=0.4.34"
 
+# System deps for gym-quadruped, placed after the JAX layer so editing them
+# doesn't invalidate the slow jax[cuda12] install cache:
+#   * build-essential + python3.10-dev : compile the `noise` C extension
+#   * libglib2.0-0 / libsm6 / libxext6 / libxrender1 : OpenCV (cv2) runtime libs
+#     (cv2 is imported by gym_quadruped.utils.mujoco.terrain; needs libgthread)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential python3.10-dev \
+        libglib2.0-0 libsm6 libxext6 libxrender1 \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt .
 # Install everything else (incl. gym-quadruped, which bundles the Go2 model).
 RUN pip install mujoco>=3.2.0 mujoco-mjx>=3.2.0 flax>=0.8.0 optax>=0.2.0 numpy>=1.26 \
