@@ -233,9 +233,13 @@ class Go2Env:
         lin_err = obs[OBS_SLICES["lin_vel_err"]]
         ang_err = obs[OBS_SLICES["ang_vel_err"]]
         r = self.rcfg
+        # Train on a gentler tracking sigma than the (very peaked) grading reward
+        # so the policy gets a usable gradient toward the command. eval_gym.py
+        # reports the true sigma=0.05 metric.
         tracking_lin = jnp.exp(-jnp.sum(lin_err[:2] ** 2)
-                               / (2 * r.sigma_lin_vel ** 2))
-        tracking_yaw = jnp.exp(-(ang_err[2] ** 2) / (2 * r.sigma_ang_vel ** 2))
+                               / (2 * r.train_sigma_lin_vel ** 2))
+        tracking_yaw = jnp.exp(-(ang_err[2] ** 2)
+                               / (2 * r.train_sigma_ang_vel ** 2))
         upright_pen = jnp.sum(gravity_b[:2] ** 2)
         z_vel_pen = lin_vel_b[2] ** 2
         rp_ang_pen = jnp.sum(ang_vel_b[:2] ** 2)

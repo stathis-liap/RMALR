@@ -85,8 +85,15 @@ class EnvConfig:
 # ---------------------------------------------------------------------------
 @dataclass
 class RewardConfig:
-    sigma_lin_vel: float = 0.05
-    sigma_ang_vel: float = 0.05
+    # Grading reward (Project-3 brief) uses sigma=0.05 -- so peaked that the
+    # tracking term is ~0 unless the robot is already within ~0.1 m/s of the
+    # command, giving no gradient to learn from. eval_gym.py keeps 0.05 (the
+    # true graded metric); TRAINING uses the gentler sigmas below so the policy
+    # gets a usable gradient toward the command (legged_gym-style shaping).
+    sigma_lin_vel: float = 0.05        # grading reference (used by eval_gym)
+    sigma_ang_vel: float = 0.05        # grading reference (used by eval_gym)
+    train_sigma_lin_vel: float = 0.35  # impl: gentler shaping for training
+    train_sigma_ang_vel: float = 0.35  # impl: gentler shaping for training
     w_tracking_lin: float = 2.0
     w_tracking_yaw: float = 1.0
     w_upright: float = 0.5
