@@ -17,6 +17,7 @@ import optax
 from ..envs.go2_env import Go2Env, randomize_models
 from ..models import networks
 from ..utils import save_pytree, load_pytree, tree_select
+from .ppo import make_tb_writer
 
 
 class AdaptTrainer:
@@ -100,6 +101,7 @@ class AdaptTrainer:
 
         env_keys = jax.random.split(k_reset, a.num_envs)
         state = self.v_reset(self.batched_model, env_keys)
+        tb = make_tb_writer(f"{self.cfg.checkpoint_dir}/tb/phase2")
 
         for it in range(a.num_iterations):
             t0 = time.time()
@@ -117,8 +119,13 @@ class AdaptTrainer:
             if it % 10 == 0:
                 sps = (a.num_envs * a.unroll_length) / (time.time() - t0)
                 print(f"[adapt] it={it} mse={float(loss):.5f} steps/s={sps:.0f}")
+                if tb is not None:
+                    tb.add_scalar("train/mse", float(loss), it)
+                    tb.add_scalar("train/steps_per_s", sps, it)
             if it % a.save_every == 0 and it > 0:
                 save_pytree(f"{self.cfg.checkpoint_dir}/phase2_{it}.pkl", phi_params)
 
         save_pytree(f"{self.cfg.checkpoint_dir}/phase2_final.pkl", phi_params)
+        if tb is not None:
+            tb.close()
         return phi_params

@@ -65,6 +65,8 @@ class State:
     step: jnp.ndarray          # scalar int
     reward: jnp.ndarray        # scalar
     done: jnp.ndarray          # scalar
+    # diagnostics: [tracking_lin, tracking_yaw, penalty_magnitude]
+    metrics: jnp.ndarray       # (3,)
     rng: jnp.ndarray
 
 
@@ -73,6 +75,14 @@ def _quat_rotate_inverse(q, v):
     w, u = q[0], q[1:4]
     t = 2.0 * jnp.cross(u, v)
     return v - w * t + jnp.cross(u, t)
+
+
+def _rp_to_quat(roll, pitch):
+    """Quaternion (wxyz) for a roll-then-pitch tilt (yaw-free)."""
+    cr, sr = jnp.cos(roll / 2), jnp.sin(roll / 2)
+    cp, sp = jnp.cos(pitch / 2), jnp.sin(pitch / 2)
+    # q = qx(roll) * qy(pitch), Hamilton product
+    return jnp.array([cr * cp, sr * cp, cr * sp, sr * sp])
 
 
 def _sample_command(key, ecfg):
@@ -104,9 +114,14 @@ class Go2Env:
         self.qvel_adr = jnp.asarray(self.layout.joint_qvel_adr)
         self.foot_geom_ids = jnp.asarray(self.layout.foot_geom_ids)
 
-        # cached init qpos/qvel
+        # cached init qpos/qvel. Spawn above the highest terrain point so feet
+        # never start inside the heightfield (it raises ground by up to z_scale);
+        # the drop-in also matches gym-quadruped's lift-until-clear reset.
+        terrain_clear = (self.ecfg.fractal_z_scale
+                         if self.ecfg.terrain == "hfield" else 0.0)
+        self.spawn_z = INIT_BASE_HEIGHT + terrain_clear + self.ecfg.reset_drop_height
         q0 = np.array(self.mj_model.qpos0, dtype=np.float32).copy()
-        q0[0:3] = [0.0, 0.0, INIT_BASE_HEIGHT]
+        q0[0:3] = [0.0, 0.0, self.spawn_z]
         q0[3:7] = [1.0, 0.0, 0.0, 0.0]
         q0[self.layout.joint_qpos_adr] = NOMINAL_POSE
         self.init_qpos = jnp.asarray(q0)
@@ -142,9 +157,25 @@ class Go2Env:
 
     # ----------------------------------------------------------------- reset
     def reset(self, model, rng):
-        rng, k1, k2, k3, k4 = jax.random.split(rng, 5)
+        rng, k1, k2, k3, k4, k5, k6, k7 = jax.random.split(rng, 8)
+        ecfg = self.ecfg
+
+        # Randomized initial state (mirrors gym-quadruped's reset, which the
+        # benchmark applies at evaluation: joint pose/vel noise + base tilt).
+        jp = jax.random.uniform(k5, (12,), minval=-ecfg.reset_joint_pos_noise,
+                                maxval=ecfg.reset_joint_pos_noise)
+        jv = jax.random.uniform(k6, (12,), minval=-ecfg.reset_joint_vel_noise,
+                                maxval=ecfg.reset_joint_vel_noise)
+        rp = jax.random.uniform(k7, (2,), minval=-ecfg.reset_rp_noise,
+                                maxval=ecfg.reset_rp_noise)
+
+        qpos = self.init_qpos
+        qpos = qpos.at[self.qpos_adr].add(jp)
+        qpos = qpos.at[3:7].set(_rp_to_quat(rp[0], rp[1]))
+        qvel = self.init_qvel.at[self.qvel_adr].add(jv)
+
         data = mjx.make_data(model)
-        data = data.replace(qpos=self.init_qpos, qvel=self.init_qvel)
+        data = data.replace(qpos=qpos, qvel=qvel)
         data = mjx.forward(model, data)
 
         kp = jax.random.uniform(k1, (), minval=self.ecfg.kp_range[0],
@@ -169,7 +200,7 @@ class Go2Env:
             prev_action=zero_a, prev_torque=jnp.zeros(self.cfg.net.action_dim),
             kp=kp, kd=kd, motor_strength=ms,
             step=jnp.zeros((), jnp.int32), reward=jnp.zeros(()),
-            done=jnp.zeros(()), rng=rng,
+            done=jnp.zeros(()), metrics=jnp.zeros(3), rng=rng,
         )
 
     # ------------------------------------------------------------------ step
@@ -260,9 +291,13 @@ class Go2Env:
         base_h = data.qpos[2]
         fell = (base_h < self.ecfg.min_base_height) | \
                (gravity_b[2] > self.ecfg.upright_z_thresh)
+        # explicit negative signal for falling (not curriculum-scaled)
+        reward = reward - r.w_termination * fell.astype(jnp.float32)
         step = state.step + 1
         timeout = step >= self.ecfg.episode_length
         done = (fell | timeout).astype(jnp.float32)
+
+        metrics = jnp.stack([tracking_lin, tracking_yaw, -penalties])
 
         e = self._privileged(model, motor_strength)
 
@@ -273,7 +308,7 @@ class Go2Env:
             data=data, obs=obs, history=history, e=e, command=command,
             prev_action=action, prev_torque=torque,
             kp=kp, kd=kd, motor_strength=motor_strength,
-            step=step, reward=reward, done=done, rng=rng,
+            step=step, reward=reward, done=done, metrics=metrics, rng=rng,
         )
 
 

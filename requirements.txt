@@ -19,3 +19,7 @@ matplotlib>=3.7        # imported by gym_quadruped's IMU sensor
 # --- Optional: rendering / video of deployment rollouts --------------------
 imageio>=2.34
 imageio-ffmpeg>=0.4
+
+# --- Training diagnostics ----------------------------------------------------
+tensorboardX>=2.6      # scalar logging from the trainers
+tensorboard>=2.15      # the web UI (run on the server, view via ssh tunnel)

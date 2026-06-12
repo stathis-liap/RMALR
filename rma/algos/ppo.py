@@ -30,6 +30,18 @@ class Transition:
     value: jnp.ndarray
     reward: jnp.ndarray
     done: jnp.ndarray
+    metrics: jnp.ndarray   # (3,) [tracking_lin, tracking_yaw, penalty_mag]
+
+
+def make_tb_writer(logdir):
+    """Optional tensorboardX writer (no-op if the package is missing)."""
+    try:
+        from tensorboardX import SummaryWriter
+        return SummaryWriter(logdir)
+    except ImportError:
+        print(f"[tb] tensorboardX not installed; skipping TensorBoard logs "
+              f"(would write to {logdir})")
+        return None
 
 
 def compute_gae(rewards, values, dones, last_value, gamma, lam):
@@ -101,11 +113,15 @@ class PPOTrainer:
             action, logp, value, _, _ = self.actor_value(params, x, a_prev, e, key)
             next_state = self.v_step(model, state, action, penalty_scale)
             done = next_state.done
+            # capture reward/metrics BEFORE auto-reset, or terminal rewards
+            # (incl. the fall penalty) would be replaced by the reset's zeros
+            reward, metrics = next_state.reward, next_state.metrics
             # auto-reset done envs (reset uses each env's advanced rng)
             reset_state = self.v_reset(model, next_state.rng)
             next_state = tree_select(done > 0.5, reset_state, next_state)
             tr = Transition(x=x, a_prev=a_prev, e=e, action=action, logp=logp,
-                            value=value, reward=next_state.reward, done=done)
+                            value=value, reward=reward, done=done,
+                            metrics=metrics)
             return (next_state, rng), tr
 
         (state, rng), traj = jax.lax.scan(
@@ -181,6 +197,7 @@ class PPOTrainer:
 
         penalty_scale = self.cfg.reward.penalty_curriculum_k0
         decay = self.cfg.reward.penalty_curriculum_decay
+        tb = make_tb_writer(f"{self.cfg.checkpoint_dir}/tb/phase1")
 
         for it in range(p.num_iterations):
             t0 = time.time()
@@ -204,12 +221,31 @@ class PPOTrainer:
             if it % 10 == 0:
                 mean_r = float(jnp.mean(traj.reward))
                 sps = (p.num_envs * p.unroll_length) / (time.time() - t0)
+                # diagnostics: reward decomposition + episode statistics
+                m = np.asarray(jax.device_get(traj.metrics)).mean(axis=(0, 1))
+                track_lin, track_yaw, pen_mag = float(m[0]), float(m[1]), float(m[2])
+                done_rate = float(jnp.mean(traj.done))
+                ep_len = 1.0 / max(done_rate, 1e-6)  # control steps, estimate
                 print(f"[ppo] it={it} reward/step={mean_r:.4f} "
+                      f"track_lin={track_lin:.3f} track_yaw={track_yaw:.3f} "
+                      f"pen={pen_mag:.3f} ep_len~{ep_len:.0f} "
                       f"loss={float(loss):.4f} penalty_k={penalty_scale:.3f} "
                       f"steps/s={sps:.0f}")
+                if tb is not None:
+                    tb.add_scalar("reward/step", mean_r, it)
+                    tb.add_scalar("reward/tracking_lin", track_lin, it)
+                    tb.add_scalar("reward/tracking_yaw", track_yaw, it)
+                    tb.add_scalar("reward/penalty_mag", pen_mag, it)
+                    tb.add_scalar("episode/done_rate", done_rate, it)
+                    tb.add_scalar("episode/length_est", ep_len, it)
+                    tb.add_scalar("train/loss", float(loss), it)
+                    tb.add_scalar("train/penalty_k", penalty_scale, it)
+                    tb.add_scalar("train/steps_per_s", sps, it)
 
             if it % p.save_every == 0 and it > 0:
                 save_pytree(f"{self.cfg.checkpoint_dir}/phase1_{it}.pkl", params)
 
         save_pytree(f"{self.cfg.checkpoint_dir}/phase1_final.pkl", params)
+        if tb is not None:
+            tb.close()
         return params

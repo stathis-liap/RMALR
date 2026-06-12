@@ -18,6 +18,13 @@
 #       python -m rma.eval_gym --phase1 checkpoints/phase1_final.pkl \
 #                              --phase2 checkpoints/phase2_final.pkl --episodes 20
 #
+# TensorBoard (trainers write to checkpoints/tb/). On the server:
+#   docker run -d --rm -v $PWD/checkpoints:/app/checkpoints -p 6006:6006 \
+#       --name rma_tb rma-go2 \
+#       tensorboard --logdir /app/checkpoints/tb --host 0.0.0.0 --port 6006
+# Then from your local PC:  ssh -L 6006:localhost:6006 <user>@<server>
+# and open http://localhost:6006
+#
 # Base: CUDA 12 + cuDNN runtime on Ubuntu 22.04 (matches jax[cuda12] wheels).
 FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 
@@ -54,6 +61,7 @@ COPY requirements.txt .
 # Install everything else (incl. gym-quadruped, which bundles the Go2 model).
 RUN pip install mujoco>=3.2.0 mujoco-mjx>=3.2.0 flax>=0.8.0 optax>=0.2.0 numpy>=1.26 \
                 "gym-quadruped>=1.1.2" "gymnasium>=1.0" scipy>=1.11 matplotlib>=3.7 \
+                tensorboardX>=2.6 tensorboard>=2.15 \
                 imageio>=2.34 imageio-ffmpeg>=0.4
 
 COPY . .

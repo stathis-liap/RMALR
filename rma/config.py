@@ -33,17 +33,30 @@ class EnvConfig:
     control_decimation: int = 10       # impl -> 50 Hz control
     episode_length: int = 1000         # control steps per episode
 
-    # Early-termination thresholds.
-    min_base_height: float = 0.18      # m (Go2 hip height ~0.28)
+    # Early-termination thresholds. NOTE: 0.18 was too close to the natural
+    # stance sag under weak randomized gains (the robot terminated standing
+    # still on flat ground) -- 0.15 leaves room for crouching during locomotion.
+    min_base_height: float = 0.15      # m (Go2 hip height ~0.28)
     # Robot considered tipped when world-down projected into base frame has
     # z-component above this (-1 = perfectly upright, 0 = on its side).
     upright_z_thresh: float = -0.5
 
+    # --- Reset-state randomization (matches gym-quadruped's reset, which adds
+    # +-20deg joint noise, +-10deg roll/pitch and a drop-in spawn; a policy
+    # trained only from the pristine nominal pose face-plants at evaluation) ---
+    reset_joint_pos_noise: float = 0.30   # rad, uniform per joint
+    reset_joint_vel_noise: float = 0.50   # rad/s, uniform per joint
+    reset_rp_noise: float = 0.15          # rad, uniform roll & pitch
+    reset_drop_height: float = 0.03       # m, spawn clearance above stance
+
     # --- Goal-conditioned velocity command (base/heading frame) -------------
     # g_t = [vx, vy, yaw_rate]. Ranges sampled at reset and (optionally) within
     # an episode to teach transitions between commands.
+    # vy widened to match evaluation: gym-quadruped's "random" command samples a
+    # speed with a uniformly random heading, so lateral commands up to the full
+    # speed magnitude occur at eval time.
     cmd_vx_range: Tuple[float, float] = (-1.0, 1.0)   # m/s forward
-    cmd_vy_range: Tuple[float, float] = (-0.6, 0.6)   # m/s lateral
+    cmd_vy_range: Tuple[float, float] = (-1.0, 1.0)   # m/s lateral
     cmd_wz_range: Tuple[float, float] = (-1.0, 1.0)   # rad/s yaw rate
     cmd_resample_prob: float = 0.005   # per control step (~1 change / 200 steps)
 
@@ -62,7 +75,9 @@ class EnvConfig:
 
     # --- Domain randomization ranges (privileged e_t) -----------------------
     friction_range: Tuple[float, float] = (0.30, 2.0)   # foot sliding friction
-    kp_range: Tuple[float, float] = (20.0, 40.0)        # PD position gain
+    # kp low end raised from 20: below ~25 the robot sags so deeply under
+    # gravity that standing is infeasible and those envs are doomed at birth.
+    kp_range: Tuple[float, float] = (25.0, 40.0)        # PD position gain
     kd_range: Tuple[float, float] = (0.4, 1.0)          # PD damping gain
     payload_range: Tuple[float, float] = (0.0, 5.0)     # kg added to trunk
     com_range: Tuple[float, float] = (-0.10, 0.10)      # m trunk COM shift x,y
@@ -100,7 +115,15 @@ class RewardConfig:
     w_z_vel: float = 0.2
     w_roll_pitch_ang: float = 0.1
     w_torque: float = 1e-4
-    w_action_rate: float = 0.01
+    # The grading reward penalizes ctrl deltas between 500 Hz substeps (tiny,
+    # since the PD target is held for 10 substeps). Training penalizes torque
+    # deltas between 50 Hz control steps -- ~10x larger deltas, squared ->
+    # ~100x harsher at the grader's 0.01. Scaled down accordingly so the
+    # penalty does not out-compete the tracking gradient.
+    w_action_rate: float = 1e-4
+    # One-shot penalty applied on a fall (early termination). Gives a clear
+    # negative signal for falling even when per-step reward is still small.
+    w_termination: float = 2.0
 
     # Penalty curriculum: penalties scaled from k0, k_{t+1}=k_t^decay -> 1.
     penalty_curriculum_k0: float = 0.1
