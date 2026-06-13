@@ -152,8 +152,12 @@ class PPOTrainer:
             v_loss = jnp.maximum((value - ret_b) ** 2, (v_clipped - ret_b) ** 2)
             value_loss = 0.5 * jnp.mean(v_loss)
 
-            total = policy_loss + p.value_loss_coef * value_loss
-            return total, (policy_loss, value_loss)
+            # Entropy bonus keeps the policy exploring (std is state-independent,
+            # so this is the same for every row but still pulls log_std up).
+            entropy = jnp.mean(networks.gaussian_entropy(log_std))
+            total = (policy_loss + p.value_loss_coef * value_loss
+                     - p.entropy_coef * entropy)
+            return total, (policy_loss, value_loss, entropy)
 
         def epoch(carry, key):
             params, opt_state = carry
@@ -166,14 +170,15 @@ class PPOTrainer:
                     params, b, adv[sl], returns[sl])
                 updates, opt_state = self.opt.update(grads, opt_state, params)
                 params = optax.apply_updates(params, updates)
-                return (params, opt_state), loss
-            (params, opt_state), losses = jax.lax.scan(
+                return (params, opt_state), (loss, aux[2])
+            (params, opt_state), (mb_loss, mb_ent) = jax.lax.scan(
                 mb_step, (params, opt_state), jnp.arange(p.num_minibatches))
-            return (params, opt_state), losses.mean()
+            return (params, opt_state), (mb_loss.mean(), mb_ent.mean())
 
         keys = jax.random.split(jax.random.PRNGKey(0), p.num_epochs)
-        (params, opt_state), losses = jax.lax.scan(epoch, (params, opt_state), keys)
-        return params, opt_state, losses.mean()
+        (params, opt_state), (ep_loss, ep_ent) = jax.lax.scan(
+            epoch, (params, opt_state), keys)
+        return params, opt_state, ep_loss.mean(), ep_ent.mean()
 
     # ---------------------------------------------------------------- train
     def train(self):
@@ -214,7 +219,8 @@ class PPOTrainer:
             adv_f = advantages.reshape(-1)
             ret_f = returns.reshape(-1)
 
-            params, opt_state, loss = update(params, opt_state, flat, adv_f, ret_f)
+            params, opt_state, loss, entropy = update(
+                params, opt_state, flat, adv_f, ret_f)
 
             penalty_scale = min(1.0, penalty_scale ** decay)
 
@@ -226,12 +232,18 @@ class PPOTrainer:
                 track_lin, track_yaw, pen_mag = float(m[0]), float(m[1]), float(m[2])
                 done_rate = float(jnp.mean(traj.done))
                 ep_len = 1.0 / max(done_rate, 1e-6)  # control steps, estimate
+                # mean action std -> direct read on whether exploration is alive
+                std = float(jnp.exp(jnp.mean(
+                    params["policy"]["params"]["log_std"])))
                 print(f"[ppo] it={it} reward/step={mean_r:.4f} "
                       f"track_lin={track_lin:.3f} track_yaw={track_yaw:.3f} "
                       f"pen={pen_mag:.3f} ep_len~{ep_len:.0f} "
+                      f"ent={float(entropy):.2f} std={std:.3f} "
                       f"loss={float(loss):.4f} penalty_k={penalty_scale:.3f} "
                       f"steps/s={sps:.0f}")
                 if tb is not None:
+                    tb.add_scalar("train/entropy", float(entropy), it)
+                    tb.add_scalar("policy/std", std, it)
                     tb.add_scalar("reward/step", mean_r, it)
                     tb.add_scalar("reward/tracking_lin", track_lin, it)
                     tb.add_scalar("reward/tracking_yaw", track_yaw, it)

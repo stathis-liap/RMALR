@@ -55,9 +55,13 @@ class EnvConfig:
     # vy widened to match evaluation: gym-quadruped's "random" command samples a
     # speed with a uniformly random heading, so lateral commands up to the full
     # speed magnitude occur at eval time.
-    cmd_vx_range: Tuple[float, float] = (-1.0, 1.0)   # m/s forward
-    cmd_vy_range: Tuple[float, float] = (-1.0, 1.0)   # m/s lateral
-    cmd_wz_range: Tuple[float, float] = (-1.0, 1.0)   # rad/s yaw rate
+    # Narrowed + forward-biased so a forward gait is discoverable first. Full
+    # omnidirectional [-1,1] from scratch is too hard to bootstrap; a robot that
+    # tracks forward well scores far better than one that stands still (the old
+    # collapse). Widen these back toward [-1,1] once it walks reliably.
+    cmd_vx_range: Tuple[float, float] = (-0.8, 1.0)   # m/s, forward-biased
+    cmd_vy_range: Tuple[float, float] = (-0.6, 0.6)   # m/s lateral
+    cmd_wz_range: Tuple[float, float] = (-0.8, 0.8)   # rad/s yaw rate
     cmd_resample_prob: float = 0.005   # per control step (~1 change / 200 steps)
 
     # Terrain. "hfield" injects a procedural fractal heightfield (1 geom, the
@@ -156,8 +160,12 @@ class NetConfig:
         (32, 32, 5, 1),
         (32, 32, 5, 1),
     )
-    log_std_init: float = -1.0
-    min_log_std: float = -1.609         # std >= 0.2 -> log(0.2)
+    # Exploration. log_std_init -1.0 (std 0.37) + floor 0.2 was far too tight:
+    # combined with NO entropy bonus the std collapsed to the floor and the
+    # robot never explored enough to find a gait. Start wider and raise the
+    # floor so even a converged policy keeps stepping-scale exploration.
+    log_std_init: float = -0.5          # std ~0.61 at init
+    min_log_std: float = -1.40          # std floor ~0.25 (was 0.2)
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +183,11 @@ class PPOConfig:
     gae_lambda: float = 0.95
     clip_ratio: float = 0.2
     value_loss_coef: float = 0.5
+    # Entropy bonus: PREVIOUSLY ABSENT (the loss had no entropy term at all).
+    # Without it the policy std collapses to the floor and the robot settles in
+    # a stand-still local optimum that tracks nothing. This is the key fix for
+    # the velocity-tracking plateau.
+    entropy_coef: float = 0.01
     max_grad_norm: float = 1.0
     seed: int = 0
     save_every: int = 250
