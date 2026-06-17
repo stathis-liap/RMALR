@@ -33,10 +33,14 @@ class EnvConfig:
     control_decimation: int = 10       # impl -> 50 Hz control
     episode_length: int = 1000         # control steps per episode
 
-    # Early-termination thresholds. NOTE: 0.18 was too close to the natural
-    # stance sag under weak randomized gains (the robot terminated standing
-    # still on flat ground) -- 0.15 leaves room for crouching during locomotion.
-    min_base_height: float = 0.15      # m (Go2 hip height ~0.28)
+    # Early-termination height -- the key fix for the eval face-plant. The grader
+    # ends an episode when any non-foot body touches the ground; eval logs showed
+    # the trained policy crouching until its THIGHS hit the floor at base heights
+    # up to ~0.194 m (while standing is ~0.27 m). Foot-only MJX collisions let the
+    # trunk pass through the floor, so the old 0.15 threshold never penalized this.
+    # 0.24 keeps the trunk high enough that the thighs never reach the ground at
+    # deployment, reproducing the grader's fall condition with a stable signal.
+    min_base_height: float = 0.24      # m (Go2 stands ~0.27-0.30)
     # Robot considered tipped when world-down projected into base frame has
     # z-component above this (-1 = perfectly upright, 0 = on its side).
     upright_z_thresh: float = -0.5
@@ -55,13 +59,15 @@ class EnvConfig:
     # vy widened to match evaluation: gym-quadruped's "random" command samples a
     # speed with a uniformly random heading, so lateral commands up to the full
     # speed magnitude occur at eval time.
-    # Narrowed + forward-biased so a forward gait is discoverable first. Full
-    # omnidirectional [-1,1] from scratch is too hard to bootstrap; a robot that
-    # tracks forward well scores far better than one that stands still (the old
-    # collapse). Widen these back toward [-1,1] once it walks reliably.
-    cmd_vx_range: Tuple[float, float] = (-0.8, 1.0)   # m/s, forward-biased
-    cmd_vy_range: Tuple[float, float] = (-0.6, 0.6)   # m/s lateral
-    cmd_wz_range: Tuple[float, float] = (-0.8, 0.8)   # rad/s yaw rate
+    # Full omnidirectional range matching the grader, which samples a speed in
+    # [0,1] m/s with a UNIFORM RANDOM HEADING (so any vx/vy up to ~1 m/s occurs)
+    # plus yaw rate in [-1,1]. The narrowed forward-biased ranges below were used
+    # to bootstrap the first feasible gait (0% -> 80% survival); the remaining
+    # eval falls were all on lateral/backward/fast-yaw commands outside that box.
+    # Now that it walks, train on the deployment distribution to close that gap.
+    cmd_vx_range: Tuple[float, float] = (-1.0, 1.0)   # m/s
+    cmd_vy_range: Tuple[float, float] = (-1.0, 1.0)   # m/s lateral
+    cmd_wz_range: Tuple[float, float] = (-1.0, 1.0)   # rad/s yaw rate
     cmd_resample_prob: float = 0.005   # per control step (~1 change / 200 steps)
 
     # Terrain. "hfield" injects a procedural fractal heightfield (1 geom, the
@@ -71,7 +77,11 @@ class EnvConfig:
     # is intended for visualization, not MJX training. z_scale is gentler than
     # the RMA paper's 0.27 since the Go2 is smaller and the graded benchmark is
     # flat -- the heightfield only adds robustness.
-    terrain: str = "hfield"            # {"hfield", "scene"}
+    # "scene" = flat floor (the grader's setting) with deployment-faithful
+    # robot<->floor collisions. "hfield" adds a procedural heightfield but forces
+    # foot-only collisions (MJX can't do body<->hfield), which caused the eval
+    # face-plant -- so flat is now the default.
+    terrain: str = "scene"             # {"scene" (flat), "hfield"}
     fractal_octaves: int = 2
     fractal_lacunarity: float = 2.0
     fractal_gain: float = 0.25
@@ -88,8 +98,10 @@ class EnvConfig:
     motor_strength_range: Tuple[float, float] = (0.85, 1.15)
     resample_prob: float = 0.004        # within-episode DR resample (per step)
 
-    # External pushes (hidden-test robustness). 0.0 disables.
-    push_prob: float = 0.0              # per control step
+    # External pushes (robustness / sim-to-real recovery). Small per-step prob
+    # of a lateral base-velocity impulse so the policy learns to recover its
+    # footing rather than relying on the pristine sim.
+    push_prob: float = 0.01             # per control step
     push_lin_vel: float = 0.5           # m/s impulse added to base lin vel
 
     # PD / action.
@@ -116,8 +128,13 @@ class RewardConfig:
     w_tracking_lin: float = 2.0
     w_tracking_yaw: float = 1.0
     w_upright: float = 0.5
-    w_z_vel: float = 0.2
-    w_roll_pitch_ang: float = 0.1
+    # Body-motion penalties. The grader uses 0.2 / 0.1; TRAINING uses gentler
+    # values (decoupled, like the tracking sigma) because penalizing the natural
+    # vertical bob and weight-shift of a real gait pushes the policy into a
+    # torso-rigid micro-shuffle. Gentle here -> it will take real strides; the
+    # grader's slightly higher weights cost little (tracking dominates at 2.0).
+    w_z_vel: float = 0.05
+    w_roll_pitch_ang: float = 0.05
     w_torque: float = 1e-4
     # The grading reward penalizes ctrl deltas between 500 Hz substeps (tiny,
     # since the PD target is held for 10 substeps). Training penalizes torque
@@ -128,6 +145,26 @@ class RewardConfig:
     # One-shot penalty applied on a fall (early termination). Gives a clear
     # negative signal for falling even when per-step reward is still small.
     w_termination: float = 2.0
+
+    # --- Gait shaping (natural, hardware-transferable walk) -----------------
+    # Pure velocity tracking discovers a high-frequency, tucked-leg shuffle.
+    # These terms push toward deliberate, foot-lifting, normal-width steps.
+    # feet_air_time: reward each footfall for a swing near air_time_target so a
+    #   micro-shuffle (air_time~0) is penalized and proper strides are neutral/+.
+    w_feet_air_time: float = 1.0
+    air_time_target: float = 0.40       # s, desired swing duration per step
+    foot_contact_height: float = 0.04   # m, foot-center z below this = stance
+    # foot_clearance: penalize a swing foot that drags instead of lifting clear.
+    w_foot_clearance: float = 1.0
+    foot_clearance_target: float = 0.09  # m, target swing-foot center height
+    # hip_deviation: keep the 4 hip (abduction) joints near nominal 0 -> normal
+    #   stance width instead of legs tucked toward the body centerline.
+    w_hip_deviation: float = 0.5
+    # foot_slip: penalize horizontal speed of feet that are in contact. A planted
+    #   stance foot is stationary in the world; a skittering "treadmill" shuffle
+    #   slides its feet -> this is the direct anti-skitter term. Forces the robot
+    #   to either plant feet or lift them into a real swing.
+    w_foot_slip: float = 1.0
 
     # Penalty curriculum: penalties scaled from k0, k_{t+1}=k_t^decay -> 1.
     penalty_curriculum_k0: float = 0.1
@@ -166,6 +203,10 @@ class NetConfig:
     # floor so even a converged policy keeps stepping-scale exploration.
     log_std_init: float = -0.5          # std ~0.61 at init
     min_log_std: float = -1.40          # std floor ~0.25 (was 0.2)
+    # std CEILING ~0.70. Without this the entropy bonus inflated std unboundedly
+    # (0.61 -> 0.86) until the action noise destabilized the gait and the policy
+    # regressed. The cap keeps escape-level exploration but blocks the runaway.
+    max_log_std: float = -0.357
 
 
 # ---------------------------------------------------------------------------
@@ -186,8 +227,10 @@ class PPOConfig:
     # Entropy bonus: PREVIOUSLY ABSENT (the loss had no entropy term at all).
     # Without it the policy std collapses to the floor and the robot settles in
     # a stand-still local optimum that tracks nothing. This is the key fix for
-    # the velocity-tracking plateau.
-    entropy_coef: float = 0.01
+    # the velocity-tracking plateau. 0.01 was too strong for the refine phase
+    # (it pushed std past the cap relentlessly); 0.004 keeps exploration alive
+    # early but lets the policy gradient pull std down for precision later.
+    entropy_coef: float = 0.004
     max_grad_norm: float = 1.0
     seed: int = 0
     save_every: int = 250

@@ -67,6 +67,37 @@ def _foot_only_collisions(model: mujoco.MjModel) -> None:
     model.geom_gap[:] = 0.0
 
 
+def _robot_floor_collisions(model: mujoco.MjModel) -> None:
+    """Enable robot<->floor collisions (but NOT robot<->robot) on flat ground.
+
+    This is the deployment-faithful collision model: in the gym-quadruped grader
+    the robot's body/legs collide with the ground and a fall is defined as any
+    non-foot body touching it. The previous foot-only model let the trunk/thighs
+    pass *through* the floor, so the policy learned ground-penetrating crouch
+    poses that instantly terminate at evaluation (0% survival).
+
+    We can't simply enable every pair: the Go2's leg/body collision primitives
+    are cylinders+boxes and MJX has no cylinder<->box narrow phase, so robot
+    self-collision pairs would break ``put_model``. Instead we use the contype/
+    conaffinity bitmask so only robot<->floor pairs survive:
+      * floor (world geom): contype=1, conaffinity=2
+      * robot *collision* geoms: contype=2, conaffinity=1
+        -> robot&floor: (2 & 2) -> collide;  robot&robot: (2 & 1)|(2 & 1)=0 -> skip
+    Visual-only geoms (contype==conaffinity==0 in the source) are left disabled
+    so we never try an MJX-unsupported mesh<->plane pair.
+    """
+    for g in range(model.ngeom):
+        if model.geom_bodyid[g] == 0:                 # world / floor plane
+            model.geom_contype[g] = 1
+            model.geom_conaffinity[g] = 2
+        elif model.geom_contype[g] or model.geom_conaffinity[g]:  # collision geom
+            model.geom_contype[g] = 2
+            model.geom_conaffinity[g] = 1
+        # else: visual-only geom -> leave non-colliding
+    model.geom_margin[:] = 0.0
+    model.geom_gap[:] = 0.0
+
+
 def _strip_sensors(spec: "mujoco.MjSpec") -> None:
     for s in list(spec.sensors):
         try:
@@ -151,5 +182,11 @@ def build_model(cfg, model_path: str) -> mujoco.MjModel:
         pass
 
     model = spec.compile()
+    # Foot-only collisions: numerically stable in MJX (sphere<->plane only). Full
+    # robot<->floor collisions (see _robot_floor_collisions) are deployment-
+    # faithful but the stiff cylinder/box<->plane penetration of an untrained,
+    # exploring policy explodes contact forces -> NaN. We instead reproduce the
+    # grader's "non-foot body touches ground = fall" rule via a base-height
+    # termination (cfg.min_base_height), which keeps the trunk/thighs clear.
     _foot_only_collisions(model)
     return model

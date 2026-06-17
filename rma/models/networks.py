@@ -35,6 +35,7 @@ class BasePolicy(nn.Module):
     action_dim: int
     log_std_init: float
     min_log_std: float
+    max_log_std: float
 
     @nn.compact
     def __call__(self, x, a_prev, z):
@@ -42,7 +43,7 @@ class BasePolicy(nn.Module):
         mean = mlp(inp, self.hidden, self.action_dim, name_prefix="pi")
         log_std = self.param("log_std", nn.initializers.constant(self.log_std_init),
                              (self.action_dim,))
-        log_std = jnp.maximum(log_std, self.min_log_std)
+        log_std = jnp.clip(log_std, self.min_log_std, self.max_log_std)
         return mean, log_std
 
 
@@ -88,7 +89,8 @@ def build_networks(cfg):
     nc = cfg.net
     encoder = EnvFactorEncoder(hidden=nc.encoder_hidden, latent_dim=nc.latent_dim)
     policy = BasePolicy(hidden=nc.policy_hidden, action_dim=nc.action_dim,
-                        log_std_init=nc.log_std_init, min_log_std=nc.min_log_std)
+                        log_std_init=nc.log_std_init, min_log_std=nc.min_log_std,
+                        max_log_std=nc.max_log_std)
     value = ValueNet(hidden=nc.value_hidden)
     adapt = AdaptationModule(embed_hidden=nc.adapt_embed_hidden,
                              embed_dim=nc.adapt_embed_dim, conv=nc.adapt_conv,

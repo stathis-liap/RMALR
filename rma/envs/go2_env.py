@@ -61,6 +61,10 @@ class State:
     kp: jnp.ndarray            # scalar
     kd: jnp.ndarray            # scalar
     motor_strength: jnp.ndarray  # (12,)
+    # gait tracking (per foot, qpos leg order FL,FR,RL,RR)
+    feet_air_time: jnp.ndarray  # (4,) seconds since each foot last left stance
+    last_contact: jnp.ndarray   # (4,) 1.0 if foot was in stance last step
+    prev_foot_xy: jnp.ndarray   # (4,2) world-frame foot xy last step (for slip)
     # bookkeeping
     step: jnp.ndarray          # scalar int
     reward: jnp.ndarray        # scalar
@@ -113,6 +117,8 @@ class Go2Env:
         self.qpos_adr = jnp.asarray(self.layout.joint_qpos_adr)
         self.qvel_adr = jnp.asarray(self.layout.joint_qvel_adr)
         self.foot_geom_ids = jnp.asarray(self.layout.foot_geom_ids)
+        # hip (abduction) joints are the 1st of each leg's [hip,thigh,calf] triple
+        self.hip_indices = jnp.asarray([0, 3, 6, 9])
 
         # cached init qpos/qvel. Spawn above the highest terrain point so feet
         # never start inside the heightfield (it raises ground by up to z_scale);
@@ -199,6 +205,8 @@ class Go2Env:
             data=data, obs=obs, history=history, e=e, command=command,
             prev_action=zero_a, prev_torque=jnp.zeros(self.cfg.net.action_dim),
             kp=kp, kd=kd, motor_strength=ms,
+            feet_air_time=jnp.zeros(4), last_contact=jnp.zeros(4),
+            prev_foot_xy=data.geom_xpos[self.foot_geom_ids, :2],
             step=jnp.zeros((), jnp.int32), reward=jnp.zeros(()),
             done=jnp.zeros(()), metrics=jnp.zeros(3), rng=rng,
         )
@@ -277,6 +285,32 @@ class Go2Env:
         torque_pen = jnp.sum(torque ** 2)
         action_rate_pen = jnp.sum((torque - state.prev_torque) ** 2)
 
+        # --- gait shaping: deliberate, foot-lifting, normal-width steps --------
+        foot_pos = data.geom_xpos[self.foot_geom_ids]            # (4,3) world pos
+        foot_z = foot_pos[:, 2]                                  # (4,) heights
+        contact = foot_z < r.foot_contact_height                 # (4,) stance
+        contact_f = contact.astype(jnp.float32)
+        # foot slip: world-frame horizontal speed of feet currently in contact
+        foot_xy = foot_pos[:, :2]
+        foot_xy_vel = (foot_xy - state.prev_foot_xy) / self.dt    # (4,2)
+        slip_pen = jnp.sum(jnp.sum(foot_xy_vel ** 2, axis=-1) * contact_f)
+        contact_filt = contact | (state.last_contact > 0.5)
+        air_time = state.feet_air_time + self.dt
+        first_contact = (state.feet_air_time > 0.0) & contact_filt
+        cmd_active = (jnp.linalg.norm(command[:2]) + jnp.abs(command[2])) > 0.1
+        # reward a footfall for a swing near air_time_target; a micro-shuffle
+        # (air_time ~ 0) yields -air_time_target. Clipped so a held-up foot
+        # can't be farmed for unbounded reward.
+        air_dev = jnp.clip(air_time - r.air_time_target,
+                           -r.air_time_target, r.air_time_target)
+        air_time_rew = jnp.sum(air_dev * first_contact) * cmd_active
+        new_feet_air_time = air_time * (1.0 - contact_filt.astype(jnp.float32))
+        # penalize a swing (airborne) foot that drags below the clearance target
+        clearance_pen = jnp.sum(
+            jnp.maximum(r.foot_clearance_target - foot_z, 0.0) * (1.0 - contact_f))
+        # keep hip (abduction) joints near nominal 0 -> normal stance width
+        hip_dev_pen = jnp.sum(q[self.hip_indices] ** 2)
+
         tracking = r.w_tracking_lin * tracking_lin + r.w_tracking_yaw * tracking_yaw
         penalties = -(
             r.w_upright * upright_pen
@@ -284,8 +318,13 @@ class Go2Env:
             + r.w_roll_pitch_ang * rp_ang_pen
             + r.w_torque * torque_pen
             + r.w_action_rate * action_rate_pen
+            + r.w_foot_clearance * clearance_pen
+            + r.w_hip_deviation * hip_dev_pen
+            + r.w_foot_slip * slip_pen
         )
-        reward = tracking + penalty_scale * penalties
+        # air-time is a positive gait shaper applied at full scale (not ramped by
+        # the penalty curriculum) so stepping is shaped throughout training.
+        reward = tracking + penalty_scale * penalties + r.w_feet_air_time * air_time_rew
 
         # --- termination ----------------------------------------------------
         base_h = data.qpos[2]
@@ -308,6 +347,8 @@ class Go2Env:
             data=data, obs=obs, history=history, e=e, command=command,
             prev_action=action, prev_torque=torque,
             kp=kp, kd=kd, motor_strength=motor_strength,
+            feet_air_time=new_feet_air_time, last_contact=contact_f,
+            prev_foot_xy=foot_xy,
             step=step, reward=reward, done=done, metrics=metrics, rng=rng,
         )
 

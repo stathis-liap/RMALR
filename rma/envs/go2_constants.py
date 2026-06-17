@@ -57,8 +57,10 @@ NOMINAL_POSE = np.array([0.0, 0.9, -1.8] * 4, dtype=np.float32)
 # Per-joint torque limit (Nm), qpos order. Go2 motors: hip/thigh 23.7, calf 45.43.
 TORQUE_LIMIT = np.array([23.7, 23.7, 45.43] * 4, dtype=np.float32)
 
-# Initial base height (m) for resets (Go2 stands ~0.30-0.33 m).
-INIT_BASE_HEIGHT = 0.32
+# Initial base height (m) for resets. The Go2 "home" keyframe stands at ~0.27 m;
+# spawn just above so the feet (not the trunk) make first contact when collisions
+# are realistic.
+INIT_BASE_HEIGHT = 0.30
 
 TRUNK_BODY_NAME = "base_link"
 
