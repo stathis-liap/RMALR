@@ -1,9 +1,9 @@
 """Flax networks for RMA (paper Sec IV-B).
 
 * EnvFactorEncoder (mu): e_t (17) -> z_t (8)
-* BasePolicy (pi):      [x_t (30), a_{t-1} (12), z_t (8)] -> action mean (12)
+* BasePolicy (pi):      [x_t (36), a_{t-1} (12), z_t (8)] -> action mean (12)
 * ValueNet (asymmetric critic): [x_t, a_{t-1}, e_t] -> scalar value
-* AdaptationModule (phi): history (k, 42) -> z_hat (8) via MLP embed + 1-D CNN
+* AdaptationModule (phi): history (k, 48) -> z_hat (8) via MLP embed + 1-D CNN
 """
 from __future__ import annotations
 
@@ -65,7 +65,7 @@ class AdaptationModule(nn.Module):
 
     @nn.compact
     def __call__(self, history):
-        # history: (..., k, 42). Embed each timestep to embed_dim.
+        # history: (..., k, 48). Embed each timestep to embed_dim.
         h = history
         for i, units in enumerate(self.embed_hidden):
             h = nn.elu(nn.Dense(units, name=f"emb{i}")(h))

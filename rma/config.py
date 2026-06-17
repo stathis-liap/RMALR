@@ -1,20 +1,15 @@
-"""Central configuration for the RMA implementation.
+"""Configuration for the RMA implementation.
 
-Target task: **Project 3 - Goal-Conditioned Go2 Velocity Tracking**
-(gym-quadruped benchmark). RMA is trained in MJX on the Unitree Go2, then a
-``Controller`` adapter runs the trained networks inside gym-quadruped for the
-official evaluation. See ``rma/controller.py`` and ``rma/eval_gym.py``.
+Task: Project 3 - goal-conditioned Go2 velocity tracking (gym-quadruped). RMA is
+trained in MJX, then a ``Controller`` runs the trained networks inside the
+benchmark for grading (see ``rma/controller.py``, ``rma/eval_gym.py``).
 
-Design choices that anchor train<->deploy consistency:
-
-* The policy state ``x_t`` is built *only* from observations the gym-quadruped
-  proprioceptive benchmark exposes, in the *same joint order* the benchmark uses
-  (``qpos[7:]`` = FL, FR, RL, RR). See ``net.state_dim`` breakdown below.
-* The robot is goal-conditioned: the velocity command enters ``x_t`` as the
-  base-frame tracking errors ``base_lin_vel_err`` (3) and ``base_ang_vel_err``
-  (3), exactly the quantities the benchmark provides.
-* The reward reproduces the Project-3 ``_compute_reward`` so MJX training
-  optimises the graded objective directly.
+Train<->deploy consistency hinges on three choices:
+* The policy state ``x_t`` is built only from observations the proprioceptive
+  benchmark exposes, in its joint order (``qpos[7:]`` = FL, FR, RL, RR).
+* The velocity command enters ``x_t`` as the base-frame tracking errors the
+  benchmark provides (goal conditioning).
+* Training reproduces the Project-3 reward, so MJX optimises the graded objective.
 """
 from __future__ import annotations
 
@@ -27,152 +22,112 @@ from typing import Tuple
 # ---------------------------------------------------------------------------
 @dataclass
 class EnvConfig:
-    # Physics. gym-quadruped runs at sim_dt=0.002 (500 Hz). We use a 500 Hz
-    # physics step with decimation 10 -> 50 Hz control (a common Go2 RL rate).
-    physics_dt: float = 0.002          # impl (500 Hz, matches gym-quadruped)
-    control_decimation: int = 10       # impl -> 50 Hz control
+    # gym-quadruped runs at 500 Hz; we match it and decimate by 10 -> 50 Hz
+    # control (a common Go2 RL rate).
+    physics_dt: float = 0.002
+    control_decimation: int = 10
     episode_length: int = 1000         # control steps per episode
 
-    # Early-termination height -- the key fix for the eval face-plant. The grader
-    # ends an episode when any non-foot body touches the ground; eval logs showed
-    # the trained policy crouching until its THIGHS hit the floor at base heights
-    # up to ~0.194 m (while standing is ~0.27 m). Foot-only MJX collisions let the
-    # trunk pass through the floor, so the old 0.15 threshold never penalized this.
-    # 0.24 keeps the trunk high enough that the thighs never reach the ground at
-    # deployment, reproducing the grader's fall condition with a stable signal.
-    min_base_height: float = 0.24      # m (Go2 stands ~0.27-0.30)
-    # Robot considered tipped when world-down projected into base frame has
-    # z-component above this (-1 = perfectly upright, 0 = on its side).
-    upright_z_thresh: float = -0.5
+    # Fall thresholds. Base height is measured above the *local* ground, so these
+    # hold on both flat and uneven terrain. Standing is ~0.27 m; 0.24 catches the
+    # crouch-until-the-thighs-scrape failure (foot-only MJX collisions let the
+    # trunk pass through the floor, so a height proxy stands in for body contact).
+    min_base_height: float = 0.24      # m above local terrain
+    upright_z_thresh: float = -0.5     # world-down in base z (-1 upright, 0 on side)
 
-    # --- Reset-state randomization (matches gym-quadruped's reset, which adds
-    # +-20deg joint noise, +-10deg roll/pitch and a drop-in spawn; a policy
-    # trained only from the pristine nominal pose face-plants at evaluation) ---
-    reset_joint_pos_noise: float = 0.30   # rad, uniform per joint
-    reset_joint_vel_noise: float = 0.50   # rad/s, uniform per joint
-    reset_rp_noise: float = 0.15          # rad, uniform roll & pitch
-    reset_drop_height: float = 0.03       # m, spawn clearance above stance
+    # Reset-state noise, mirroring gym-quadruped's reset (which the grader also
+    # applies): per-joint pose/vel noise, base roll/pitch tilt, and a small drop-in.
+    reset_joint_pos_noise: float = 0.30   # rad
+    reset_joint_vel_noise: float = 0.50   # rad/s
+    reset_rp_noise: float = 0.15          # rad, roll & pitch
+    reset_drop_height: float = 0.03       # m, spawn clearance above the ground
+    reset_xy_range: float = 4.0           # m, random spawn xy (terrain variety)
 
-    # --- Goal-conditioned velocity command (base/heading frame) -------------
-    # g_t = [vx, vy, yaw_rate]. Ranges sampled at reset and (optionally) within
-    # an episode to teach transitions between commands.
-    # vy widened to match evaluation: gym-quadruped's "random" command samples a
-    # speed with a uniformly random heading, so lateral commands up to the full
-    # speed magnitude occur at eval time.
-    # Full omnidirectional range matching the grader, which samples a speed in
-    # [0,1] m/s with a UNIFORM RANDOM HEADING (so any vx/vy up to ~1 m/s occurs)
-    # plus yaw rate in [-1,1]. The narrowed forward-biased ranges below were used
-    # to bootstrap the first feasible gait (0% -> 80% survival); the remaining
-    # eval falls were all on lateral/backward/fast-yaw commands outside that box.
-    # Now that it walks, train on the deployment distribution to close that gap.
+    # Goal-conditioned velocity command g_t = [vx, vy, yaw_rate], base frame. Full
+    # omnidirectional range matching the grader (a speed in [0,1] m/s with uniform
+    # random heading, plus yaw in [-1,1]); resampled occasionally within an episode
+    # so the policy learns command transitions.
     cmd_vx_range: Tuple[float, float] = (-1.0, 1.0)   # m/s
-    cmd_vy_range: Tuple[float, float] = (-1.0, 1.0)   # m/s lateral
-    cmd_wz_range: Tuple[float, float] = (-1.0, 1.0)   # rad/s yaw rate
-    cmd_resample_prob: float = 0.005   # per control step (~1 change / 200 steps)
+    cmd_vy_range: Tuple[float, float] = (-1.0, 1.0)   # m/s
+    cmd_wz_range: Tuple[float, float] = (-1.0, 1.0)   # rad/s
+    cmd_resample_prob: float = 0.005                  # per control step
 
-    # Terrain. "hfield" injects a procedural fractal heightfield (1 geom, the
-    # MJX-efficient choice) over the plain base scene -- this is the training
-    # default. "scene" uses whatever geometry the model XML carries as-is; note
-    # the 700-box make_jagged_scene field is too dense for MJX put_model, so it
-    # is intended for visualization, not MJX training. z_scale is gentler than
-    # the RMA paper's 0.27 since the Go2 is smaller and the graded benchmark is
-    # flat -- the heightfield only adds robustness.
-    # "scene" = flat floor (the grader's setting) with deployment-faithful
-    # robot<->floor collisions. "hfield" adds a procedural heightfield but forces
-    # foot-only collisions (MJX can't do body<->hfield), which caused the eval
-    # face-plant -- so flat is now the default.
-    terrain: str = "scene"             # {"scene" (flat), "hfield"}
+    # Terrain. "hfield" trains on a procedural fractal heightfield (1 shared geom,
+    # the MJX-efficient choice); per-env variety comes from the random spawn xy.
+    # "scene" uses the flat plane the grader evaluates on. Either way collisions
+    # are foot-only (MJX can't body<->hfield), and terrain stays gentle since the
+    # benchmark is flat -- the heightfield only adds robustness (as in the paper).
+    terrain: str = "hfield"            # {"hfield", "scene" (flat)}
+    hfield_radius: float = 20.0        # m, half-extent (large enough to walk on)
+    hfield_grid: int = 256             # cells per side
     fractal_octaves: int = 2
     fractal_lacunarity: float = 2.0
     fractal_gain: float = 0.25
-    fractal_z_scale: float = 0.08
+    fractal_base_freq: int = 16        # coarsest fBm frequency (features/width)
+    fractal_z_scale: float = 0.10      # m, peak elevation
 
-    # --- Domain randomization ranges (privileged e_t) -----------------------
-    friction_range: Tuple[float, float] = (0.30, 2.0)   # foot sliding friction
-    # kp low end raised from 20: below ~25 the robot sags so deeply under
-    # gravity that standing is infeasible and those envs are doomed at birth.
-    kp_range: Tuple[float, float] = (25.0, 40.0)        # PD position gain
-    kd_range: Tuple[float, float] = (0.4, 1.0)          # PD damping gain
+    # Domain randomization (privileged e_t). kp floor is 25: below ~25 the robot
+    # sags too far under gravity to stand, dooming those envs at birth.
+    friction_range: Tuple[float, float] = (0.30, 2.0)
+    kp_range: Tuple[float, float] = (25.0, 40.0)
+    kd_range: Tuple[float, float] = (0.4, 1.0)
     payload_range: Tuple[float, float] = (0.0, 5.0)     # kg added to trunk
-    com_range: Tuple[float, float] = (-0.10, 0.10)      # m trunk COM shift x,y
+    com_range: Tuple[float, float] = (-0.10, 0.10)      # m trunk COM xy shift
     motor_strength_range: Tuple[float, float] = (0.85, 1.15)
-    resample_prob: float = 0.004        # within-episode DR resample (per step)
+    resample_prob: float = 0.004        # within-episode DR resample, per step
 
-    # External pushes (robustness / sim-to-real recovery). Small per-step prob
-    # of a lateral base-velocity impulse so the policy learns to recover its
-    # footing rather than relying on the pristine sim.
+    # External pushes: occasional lateral base-velocity impulse so the policy
+    # learns to recover its footing instead of relying on the pristine sim.
     push_prob: float = 0.01             # per control step
-    push_lin_vel: float = 0.5           # m/s impulse added to base lin vel
+    push_lin_vel: float = 0.5           # m/s
 
-    # PD / action.
     action_scale: float = 0.30          # action is a residual on the nominal pose
-
-    # History length for the adaptation module (k timesteps).
-    history_len: int = 50
+    history_len: int = 50               # k timesteps fed to the adaptation module
 
 
 # ---------------------------------------------------------------------------
-# Reward coefficients (Project-3 _compute_reward, reproduced exactly)
+# Reward (Project-3 _compute_reward, reproduced for training)
 # ---------------------------------------------------------------------------
 @dataclass
 class RewardConfig:
-    # Grading reward (Project-3 brief) uses sigma=0.05 -- so peaked that the
-    # tracking term is ~0 unless the robot is already within ~0.1 m/s of the
-    # command, giving no gradient to learn from. eval_gym.py keeps 0.05 (the
-    # true graded metric); TRAINING uses the gentler sigmas below so the policy
-    # gets a usable gradient toward the command (legged_gym-style shaping).
-    sigma_lin_vel: float = 0.05        # grading reference (used by eval_gym)
-    sigma_ang_vel: float = 0.05        # grading reference (used by eval_gym)
-    train_sigma_lin_vel: float = 0.35  # impl: gentler shaping for training
-    train_sigma_ang_vel: float = 0.35  # impl: gentler shaping for training
-    w_tracking_lin: float = 2.0
-    w_tracking_yaw: float = 1.0
+    # The graded reward's sigma=0.05 is so peaked it gives no gradient until the
+    # robot is already within ~0.1 m/s of the command. eval_gym keeps 0.05 (the
+    # true metric); training uses gentler sigmas for a usable gradient. These are
+    # tightened (0.35->0.25) and the tracking weight raised to prioritise velocity
+    # accuracy (target ~95%), while staying loose enough not to kill early motion.
+    sigma_lin_vel: float = 0.05        # grading reference (eval_gym)
+    sigma_ang_vel: float = 0.05
+    train_sigma_lin_vel: float = 0.25  # tighter -> demands more precision
+    train_sigma_ang_vel: float = 0.30
+    w_tracking_lin: float = 3.0        # tracking dominates the other terms
+    w_tracking_yaw: float = 1.5
     w_upright: float = 0.5
-    # Body-motion penalties. The grader uses 0.2 / 0.1; TRAINING uses gentler
-    # values (decoupled, like the tracking sigma) because penalizing the natural
-    # vertical bob and weight-shift of a real gait pushes the policy into a
-    # torso-rigid micro-shuffle. Gentle here -> it will take real strides; the
-    # grader's slightly higher weights cost little (tracking dominates at 2.0).
+    # Body-motion penalties, gentler than the grader's 0.2/0.1: penalizing a real
+    # gait's natural bob/weight-shift drives the policy into a rigid micro-shuffle.
     w_z_vel: float = 0.05
     w_roll_pitch_ang: float = 0.05
     w_torque: float = 1e-4
-    # The grading reward penalizes ctrl deltas between 500 Hz substeps (tiny,
-    # since the PD target is held for 10 substeps). Training penalizes torque
-    # deltas between 50 Hz control steps -- ~10x larger deltas, squared ->
-    # ~100x harsher at the grader's 0.01. Scaled down accordingly so the
-    # penalty does not out-compete the tracking gradient.
-    w_action_rate: float = 1e-4
-    # One-shot penalty applied on a fall (early termination). Gives a clear
-    # negative signal for falling even when per-step reward is still small.
-    w_termination: float = 2.0
+    w_action_rate: float = 1e-4        # on 50 Hz torque deltas (see env)
+    w_termination: float = 2.0         # one-shot penalty on a fall
 
-    # --- Gait shaping (natural, hardware-transferable walk) -----------------
-    # Pure velocity tracking discovers a high-frequency, tucked-leg shuffle.
-    # These terms push toward deliberate, foot-lifting, normal-width steps.
-    # feet_air_time: reward each footfall for a swing near air_time_target so a
-    #   micro-shuffle (air_time~0) is penalized and proper strides are neutral/+.
-    w_feet_air_time: float = 1.0
-    air_time_target: float = 0.40       # s, desired swing duration per step
-    foot_contact_height: float = 0.04   # m, foot-center z below this = stance
-    # foot_clearance: penalize a swing foot that drags instead of lifting clear.
-    w_foot_clearance: float = 1.0
-    foot_clearance_target: float = 0.09  # m, target swing-foot center height
-    # hip_deviation: keep the 4 hip (abduction) joints near nominal 0 -> normal
-    #   stance width instead of legs tucked toward the body centerline.
-    w_hip_deviation: float = 0.5
-    # foot_slip: penalize horizontal speed of feet that are in contact. A planted
-    #   stance foot is stationary in the world; a skittering "treadmill" shuffle
-    #   slides its feet -> this is the direct anti-skitter term. Forces the robot
-    #   to either plant feet or lift them into a real swing.
-    w_foot_slip: float = 1.0
+    # Gait shaping -> a deliberate, foot-lifting, normal-width walk instead of the
+    # tucked-leg shuffle pure tracking discovers.
+    w_feet_air_time: float = 1.0       # reward footfalls near air_time_target
+    air_time_target: float = 0.40      # s, desired swing duration
+    foot_contact_height: float = 0.04  # m, foot-center z below this = stance
+    w_foot_clearance: float = 1.0      # penalize a swing foot that drags
+    foot_clearance_target: float = 0.072  # m, swing-foot height (lowered ~20%)
+    w_hip_deviation: float = 0.5       # keep hips near nominal -> normal width
+    w_foot_slip: float = 1.0           # penalize horizontal speed of stance feet
 
-    # Penalty curriculum: penalties scaled from k0, k_{t+1}=k_t^decay -> 1.
+    # Penalties ramp from k0 to 1 via k_{t+1}=k_t^decay (avoids an early all-
+    # negative reward that collapses to standing still).
     penalty_curriculum_k0: float = 0.1
     penalty_curriculum_decay: float = 0.997
 
 
 # ---------------------------------------------------------------------------
-# Network architecture
+# Network architecture (paper Sec IV-B)
 # ---------------------------------------------------------------------------
 @dataclass
 class NetConfig:
@@ -197,16 +152,12 @@ class NetConfig:
         (32, 32, 5, 1),
         (32, 32, 5, 1),
     )
-    # Exploration. log_std_init -1.0 (std 0.37) + floor 0.2 was far too tight:
-    # combined with NO entropy bonus the std collapsed to the floor and the
-    # robot never explored enough to find a gait. Start wider and raise the
-    # floor so even a converged policy keeps stepping-scale exploration.
-    log_std_init: float = -0.5          # std ~0.61 at init
-    min_log_std: float = -1.40          # std floor ~0.25 (was 0.2)
-    # std CEILING ~0.70. Without this the entropy bonus inflated std unboundedly
-    # (0.61 -> 0.86) until the action noise destabilized the gait and the policy
-    # regressed. The cap keeps escape-level exploration but blocks the runaway.
-    max_log_std: float = -0.357
+    # Exploration std, clamped to [min, max]. The floor keeps stepping-scale
+    # noise alive; the ceiling stops the entropy bonus inflating std until the
+    # action noise destabilizes the gait.
+    log_std_init: float = -0.5          # std ~0.61
+    min_log_std: float = -1.40          # std floor ~0.25
+    max_log_std: float = -0.357         # std ceiling ~0.70
 
 
 # ---------------------------------------------------------------------------
@@ -224,12 +175,9 @@ class PPOConfig:
     gae_lambda: float = 0.95
     clip_ratio: float = 0.2
     value_loss_coef: float = 0.5
-    # Entropy bonus: PREVIOUSLY ABSENT (the loss had no entropy term at all).
-    # Without it the policy std collapses to the floor and the robot settles in
-    # a stand-still local optimum that tracks nothing. This is the key fix for
-    # the velocity-tracking plateau. 0.01 was too strong for the refine phase
-    # (it pushed std past the cap relentlessly); 0.004 keeps exploration alive
-    # early but lets the policy gradient pull std down for precision later.
+    # Entropy bonus keeps std off its floor (without it the policy collapses to a
+    # stand-still that tracks nothing). 0.004 explores early but lets the policy
+    # gradient pull std down for precision later.
     entropy_coef: float = 0.004
     max_grad_norm: float = 1.0
     seed: int = 0
@@ -243,7 +191,7 @@ class PPOConfig:
 class AdaptConfig:
     num_envs: int = 4096
     unroll_length: int = 50            # >= history_len for valid windows
-    num_iterations: int = 1000
+    num_iterations: int = 2000
     num_minibatches: int = 4
     learning_rate: float = 5e-4
     seed: int = 1
@@ -258,14 +206,8 @@ class Config:
     ppo: PPOConfig = field(default_factory=PPOConfig)
     adapt: AdaptConfig = field(default_factory=AdaptConfig)
 
-    # Base Go2 scene (robot + flat plane). With terrain="hfield" (the default)
-    # the plane is replaced by a procedural fractal heightfield at build time;
-    # the dense make_jagged_scene.xml is kept for visualization only (too many
-    # geoms for MJX). In the Docker image this lives one directory above the
-    # repo (see Dockerfile).
-    # "auto" -> the Go2 MJCF bundled inside the gym-quadruped pip package. This
-    # keeps the repo self-contained (no external model tree) and means MJX
-    # training uses the exact model the grader evaluates on. Override with a path
-    # to a custom scene if desired.
+    # "auto" -> the Go2 MJCF bundled in the gym-quadruped pip package, so MJX
+    # training and the grader use the exact same model. Override with a path to a
+    # custom scene if desired.
     model_path: str = "auto"
     checkpoint_dir: str = "checkpoints"

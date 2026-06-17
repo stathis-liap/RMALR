@@ -28,6 +28,7 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 import numpy as np
+import mujoco
 from mujoco import mjx
 from flax import struct
 
@@ -89,6 +90,21 @@ def _rp_to_quat(roll, pitch):
     return jnp.array([cr * cp, sr * cp, cr * sp, sr * sp])
 
 
+def _bilinear(grid, row, col):
+    """Bilinearly sample `grid` (nrow, ncol) at fractional (row, col), clamped."""
+    nrow, ncol = grid.shape
+    row = jnp.clip(row, 0.0, nrow - 1.0)
+    col = jnp.clip(col, 0.0, ncol - 1.0)
+    r0 = jnp.floor(row).astype(jnp.int32)
+    c0 = jnp.floor(col).astype(jnp.int32)
+    r1 = jnp.minimum(r0 + 1, nrow - 1)
+    c1 = jnp.minimum(c0 + 1, ncol - 1)
+    tr, tc = row - r0, col - c0
+    top = grid[r0, c0] * (1 - tc) + grid[r0, c1] * tc
+    bot = grid[r1, c0] * (1 - tc) + grid[r1, c1] * tc
+    return top * (1 - tr) + bot * tr
+
+
 def _sample_command(key, ecfg):
     k1, k2, k3 = jax.random.split(key, 3)
     vx = jax.random.uniform(k1, (), minval=ecfg.cmd_vx_range[0],
@@ -120,18 +136,46 @@ class Go2Env:
         # hip (abduction) joints are the 1st of each leg's [hip,thigh,calf] triple
         self.hip_indices = jnp.asarray([0, 3, 6, 9])
 
-        # cached init qpos/qvel. Spawn above the highest terrain point so feet
-        # never start inside the heightfield (it raises ground by up to z_scale);
-        # the drop-in also matches gym-quadruped's lift-until-clear reset.
-        terrain_clear = (self.ecfg.fractal_z_scale
-                         if self.ecfg.terrain == "hfield" else 0.0)
-        self.spawn_z = INIT_BASE_HEIGHT + terrain_clear + self.ecfg.reset_drop_height
+        self._load_terrain()
+
+        # Nominal stance qpos; reset overrides the base xy/z each episode.
         q0 = np.array(self.mj_model.qpos0, dtype=np.float32).copy()
-        q0[0:3] = [0.0, 0.0, self.spawn_z]
         q0[3:7] = [1.0, 0.0, 0.0, 0.0]
         q0[self.layout.joint_qpos_adr] = NOMINAL_POSE
         self.init_qpos = jnp.asarray(q0)
         self.init_qvel = jnp.zeros(self.mj_model.nv)
+
+    # --------------------------------------------------------------- terrain
+    def _load_terrain(self):
+        """Cache the heightfield grid so ground elevation is queryable in JAX.
+
+        With no hfield (flat ground) elevation is identically 0. A single field is
+        shared across the vmapped batch; per-env variety comes from spawn xy.
+        """
+        m = self.mj_model
+        self._has_hfield = m.nhfield > 0
+        if not self._has_hfield:
+            return
+        gid = int(np.where(m.geom_type == mujoco.mjtGeom.mjGEOM_HFIELD)[0][0])
+        hid = int(m.geom_dataid[gid])
+        nrow, ncol = int(m.hfield_nrow[hid]), int(m.hfield_ncol[hid])
+        adr = int(m.hfield_adr[hid])
+        data = np.asarray(m.hfield_data[adr:adr + nrow * ncol]).reshape(nrow, ncol)
+        rx, ry, ez, _ = m.hfield_size[hid]
+        self._hf_grid = jnp.asarray(data)               # (nrow, ncol), in [0,1]
+        self._hf_rxy = (float(rx), float(ry))           # x,y half-extents (m)
+        self._hf_elev = float(ez)                       # elevation scale (m)
+        self._hf_xy = jnp.asarray(m.geom_pos[gid, :2])  # field centre (m)
+
+    def _terrain_height(self, xy):
+        """Ground elevation (m) under world `xy` (..., 2). 0 on flat ground."""
+        if not self._has_hfield:
+            return jnp.zeros(xy.shape[:-1])
+        rx, ry = self._hf_rxy
+        nrow, ncol = self._hf_grid.shape
+        col = (xy[..., 0] - self._hf_xy[0] + rx) / (2 * rx) * (ncol - 1)
+        row = (xy[..., 1] - self._hf_xy[1] + ry) / (2 * ry) * (nrow - 1)
+        return _bilinear(self._hf_grid, row, col) * self._hf_elev
 
     # ------------------------------------------------------------------ utils
     def _kinematics(self, data):
@@ -151,11 +195,10 @@ class Go2Env:
         ang_err = target_ang - ang_vel_b
         return jnp.concatenate([gravity_b, ang_vel_b, q, qd, lin_err, ang_err])
 
-    def _privileged(self, model, motor_strength):
+    def _privileged(self, model, motor_strength, terrain_h):
         friction = model.geom_friction[self.foot_geom_ids[0], 0]
         payload = model.body_mass[self.layout.trunk_body_id]
         com = model.body_ipos[self.layout.trunk_body_id, 0:2]
-        terrain_h = jnp.zeros(())
         return jnp.concatenate([
             payload.reshape(1), com, motor_strength,
             friction.reshape(1), terrain_h.reshape(1),
@@ -163,19 +206,26 @@ class Go2Env:
 
     # ----------------------------------------------------------------- reset
     def reset(self, model, rng):
-        rng, k1, k2, k3, k4, k5, k6, k7 = jax.random.split(rng, 8)
+        rng, k1, k2, k3, k4, k5, k6, k7, k8 = jax.random.split(rng, 9)
         ecfg = self.ecfg
 
-        # Randomized initial state (mirrors gym-quadruped's reset, which the
-        # benchmark applies at evaluation: joint pose/vel noise + base tilt).
+        # Initial-state noise mirrors gym-quadruped's reset (joint pose/vel noise
+        # + base tilt + drop-in), which the benchmark also applies at eval.
         jp = jax.random.uniform(k5, (12,), minval=-ecfg.reset_joint_pos_noise,
                                 maxval=ecfg.reset_joint_pos_noise)
         jv = jax.random.uniform(k6, (12,), minval=-ecfg.reset_joint_vel_noise,
                                 maxval=ecfg.reset_joint_vel_noise)
         rp = jax.random.uniform(k7, (2,), minval=-ecfg.reset_rp_noise,
                                 maxval=ecfg.reset_rp_noise)
+        # Random spawn xy -> each env samples a different patch of the shared
+        # terrain; drop in just above the ground at that point.
+        xy = jax.random.uniform(k8, (2,), minval=-ecfg.reset_xy_range,
+                                maxval=ecfg.reset_xy_range)
+        terrain_h = self._terrain_height(xy)
 
         qpos = self.init_qpos
+        qpos = qpos.at[0:2].set(xy)
+        qpos = qpos.at[2].set(terrain_h + INIT_BASE_HEIGHT + ecfg.reset_drop_height)
         qpos = qpos.at[self.qpos_adr].add(jp)
         qpos = qpos.at[3:7].set(_rp_to_quat(rp[0], rp[1]))
         qvel = self.init_qvel.at[self.qvel_adr].add(jv)
@@ -195,7 +245,7 @@ class Go2Env:
 
         gravity_b, lin_vel_b, ang_vel_b, q, qd = self._kinematics(data)
         obs = self._make_obs(gravity_b, lin_vel_b, ang_vel_b, q, qd, command)
-        e = self._privileged(model, ms)
+        e = self._privileged(model, ms, terrain_h)
 
         zero_a = jnp.zeros(self.cfg.net.action_dim)
         hist_row = jnp.concatenate([obs, zero_a])
@@ -285,31 +335,29 @@ class Go2Env:
         torque_pen = jnp.sum(torque ** 2)
         action_rate_pen = jnp.sum((torque - state.prev_torque) ** 2)
 
-        # --- gait shaping: deliberate, foot-lifting, normal-width steps --------
-        foot_pos = data.geom_xpos[self.foot_geom_ids]            # (4,3) world pos
-        foot_z = foot_pos[:, 2]                                  # (4,) heights
-        contact = foot_z < r.foot_contact_height                 # (4,) stance
-        contact_f = contact.astype(jnp.float32)
-        # foot slip: world-frame horizontal speed of feet currently in contact
+        # --- gait shaping: deliberate, foot-lifting, normal-width steps -------
+        # Foot heights are taken above the *local* ground so contact/clearance
+        # work on the heightfield too (flat -> foot_terrain = 0).
+        foot_pos = data.geom_xpos[self.foot_geom_ids]           # (4,3) world
         foot_xy = foot_pos[:, :2]
-        foot_xy_vel = (foot_xy - state.prev_foot_xy) / self.dt    # (4,2)
+        foot_h = foot_pos[:, 2] - self._terrain_height(foot_xy)  # above ground
+        contact = foot_h < r.foot_contact_height                # (4,) stance
+        contact_f = contact.astype(jnp.float32)
+        foot_xy_vel = (foot_xy - state.prev_foot_xy) / self.dt
         slip_pen = jnp.sum(jnp.sum(foot_xy_vel ** 2, axis=-1) * contact_f)
         contact_filt = contact | (state.last_contact > 0.5)
         air_time = state.feet_air_time + self.dt
         first_contact = (state.feet_air_time > 0.0) & contact_filt
         cmd_active = (jnp.linalg.norm(command[:2]) + jnp.abs(command[2])) > 0.1
-        # reward a footfall for a swing near air_time_target; a micro-shuffle
-        # (air_time ~ 0) yields -air_time_target. Clipped so a held-up foot
-        # can't be farmed for unbounded reward.
+        # reward each footfall for a swing near air_time_target; clipped so a
+        # micro-shuffle (~0) is penalized and a held-up foot can't be farmed.
         air_dev = jnp.clip(air_time - r.air_time_target,
                            -r.air_time_target, r.air_time_target)
         air_time_rew = jnp.sum(air_dev * first_contact) * cmd_active
         new_feet_air_time = air_time * (1.0 - contact_filt.astype(jnp.float32))
-        # penalize a swing (airborne) foot that drags below the clearance target
-        clearance_pen = jnp.sum(
-            jnp.maximum(r.foot_clearance_target - foot_z, 0.0) * (1.0 - contact_f))
-        # keep hip (abduction) joints near nominal 0 -> normal stance width
-        hip_dev_pen = jnp.sum(q[self.hip_indices] ** 2)
+        clearance_pen = jnp.sum(                                # swing foot drag
+            jnp.maximum(r.foot_clearance_target - foot_h, 0.0) * (1.0 - contact_f))
+        hip_dev_pen = jnp.sum(q[self.hip_indices] ** 2)         # hips near 0 -> width
 
         tracking = r.w_tracking_lin * tracking_lin + r.w_tracking_yaw * tracking_yaw
         penalties = -(
@@ -327,7 +375,10 @@ class Go2Env:
         reward = tracking + penalty_scale * penalties + r.w_feet_air_time * air_time_rew
 
         # --- termination ----------------------------------------------------
-        base_h = data.qpos[2]
+        # Measure base height above the *local* ground so a bump/dip in the
+        # heightfield isn't mistaken for standing/falling (flat -> terrain_h=0).
+        terrain_h = self._terrain_height(data.qpos[0:2])
+        base_h = data.qpos[2] - terrain_h
         fell = (base_h < self.ecfg.min_base_height) | \
                (gravity_b[2] > self.ecfg.upright_z_thresh)
         # explicit negative signal for falling (not curriculum-scaled)
@@ -338,7 +389,7 @@ class Go2Env:
 
         metrics = jnp.stack([tracking_lin, tracking_yaw, -penalties])
 
-        e = self._privileged(model, motor_strength)
+        e = self._privileged(model, motor_strength, terrain_h)
 
         hist_row = jnp.concatenate([obs, action])
         history = jnp.concatenate([state.history[1:], hist_row[None]], axis=0)

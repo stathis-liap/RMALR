@@ -1,18 +1,18 @@
-"""Build the Go2 MjModel used by the RMA MJX env.
+"""Build the Go2 ``MjModel`` for the RMA MJX env.
 
-We load the Go2 scene (e.g. the jagged scene from tools/make_jagged_scene.py).
-RMA applies joint torques computed in Python (PD on a residual joint-position
-target) directly via ``data.qfrc_applied``, which lets us randomize
-Kp/Kd/motor-strength per environment without editing the model and keeps the
-action -> torque path identical between MJX training and the CPU deployment
-Controller. The model's own torque actuators are left in place but never driven
-(``data.ctrl`` stays 0, so they add zero generalized force); removing them would
-invalidate the Go2 "home" keyframe's ctrl vector.
+Torque is computed in Python (PD on a residual joint target) and applied through
+``data.qfrc_applied``, so per-env Kp/Kd/motor-strength randomization needs no
+model edits and the action->torque path is identical in MJX training and the CPU
+Controller. The model's own actuators are left in place but never driven.
 
-We *do* strip <sensor> definitions: MJX only supports a subset of sensor types,
-and the RMA env reads everything it needs (joint state, base pose/velocity,
-contacts) directly from mjx.Data. The benchmark's own sensors (IMU etc.) are
-re-created by gym-quadruped at evaluation time.
+Sensors are stripped: MJX supports only a subset, the env reads state straight
+from ``mjx.Data``, and gym-quadruped recreates its own sensors at eval time.
+
+Collisions are restricted to foot<->terrain. The Go2 leg/trunk primitives are
+cylinders/boxes that MJX cannot narrow-phase against a plane or heightfield, and
+an exploring policy penetrating them blows contact forces up to NaN. The grader's
+"a non-foot body touching the ground is a fall" rule is instead reproduced by the
+terrain-relative base-height termination in ``Go2Env``.
 
 Requires mujoco >= 3.2 for the MjSpec editing API.
 """
@@ -27,74 +27,25 @@ from .go2_constants import LEGS_QPOS, resolve_model_path
 
 
 def _foot_only_collisions(model: mujoco.MjModel) -> None:
-    """Restrict collisions to foot <-> terrain only (critical for MJX).
+    """Keep only foot<->terrain collision pairs, via contype/conaffinity masks.
 
-    Two problems with the stock Unitree Go2 + jagged scene under MJX:
-
-    1. The Go2 MJCF carries box/cylinder collision primitives on the trunk and
-       legs; MJX does not implement some of those narrow-phase pairs (e.g.
-       cylinder<->box), and self/body collisions are irrelevant for locomotion.
-    2. The jagged scene has ~700 terrain boxes, all with the default
-       contype/conaffinity=1. MJX enumerates collision pairs host-side at
-       ``put_model``, so leaving them mutually collidable creates ~C(700,2)
-       box<->box pairs and makes ``put_model`` hang / run out of memory.
-
-    Collision policy applied here (via contype/conaffinity bitmasks):
-      * feet (sphere geoms named FL/FR/RL/RR): contype=1, conaffinity=1
-      * world/terrain geoms (floor plane + boxes): conaffinity=0 (they act only
-        as a contact *target* for the feet -> no terrain<->terrain pairs)
-      * all other robot geoms: collisions disabled entirely
-    Result: only foot<->terrain (and trivial foot<->foot) pairs survive.
-    Termination uses base height/orientation, not base contact, so disabling
-    trunk collision in MJX is safe.
+    Feet collide with the world; the world (floor/heightfield) only acts as their
+    target; every other robot geom is disabled. This avoids both MJX-unsupported
+    narrow phases and the O(n^2) terrain<->terrain pairs that stall ``put_model``.
     """
     foot_names = set(LEGS_QPOS)
     for g in range(model.ngeom):
-        body_id = model.geom_bodyid[g]
         name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, g)
-        if body_id == 0:                       # world / terrain geom
-            model.geom_conaffinity[g] = 0      # collide only as feet's target
+        if model.geom_bodyid[g] == 0:          # world / terrain
             model.geom_contype[g] = 1
+            model.geom_conaffinity[g] = 0      # collide only as a foot target
         elif name in foot_names:               # foot
             model.geom_contype[g] = 1
             model.geom_conaffinity[g] = 1
         else:                                  # other robot geom
             model.geom_contype[g] = 0
             model.geom_conaffinity[g] = 0
-    # MJX has not implemented margin/gap for some narrow-phase pairs (e.g.
-    # hfield<->sphere). We don't use collision margins, so zero them globally.
-    model.geom_margin[:] = 0.0
-    model.geom_gap[:] = 0.0
-
-
-def _robot_floor_collisions(model: mujoco.MjModel) -> None:
-    """Enable robot<->floor collisions (but NOT robot<->robot) on flat ground.
-
-    This is the deployment-faithful collision model: in the gym-quadruped grader
-    the robot's body/legs collide with the ground and a fall is defined as any
-    non-foot body touching it. The previous foot-only model let the trunk/thighs
-    pass *through* the floor, so the policy learned ground-penetrating crouch
-    poses that instantly terminate at evaluation (0% survival).
-
-    We can't simply enable every pair: the Go2's leg/body collision primitives
-    are cylinders+boxes and MJX has no cylinder<->box narrow phase, so robot
-    self-collision pairs would break ``put_model``. Instead we use the contype/
-    conaffinity bitmask so only robot<->floor pairs survive:
-      * floor (world geom): contype=1, conaffinity=2
-      * robot *collision* geoms: contype=2, conaffinity=1
-        -> robot&floor: (2 & 2) -> collide;  robot&robot: (2 & 1)|(2 & 1)=0 -> skip
-    Visual-only geoms (contype==conaffinity==0 in the source) are left disabled
-    so we never try an MJX-unsupported mesh<->plane pair.
-    """
-    for g in range(model.ngeom):
-        if model.geom_bodyid[g] == 0:                 # world / floor plane
-            model.geom_contype[g] = 1
-            model.geom_conaffinity[g] = 2
-        elif model.geom_contype[g] or model.geom_conaffinity[g]:  # collision geom
-            model.geom_contype[g] = 2
-            model.geom_conaffinity[g] = 1
-        # else: visual-only geom -> leave non-colliding
-    model.geom_margin[:] = 0.0
+    model.geom_margin[:] = 0.0                 # unused; zero for MJX safety
     model.geom_gap[:] = 0.0
 
 
@@ -106,75 +57,54 @@ def _strip_sensors(spec: "mujoco.MjSpec") -> None:
             pass
 
 
-def _add_heightfield(spec: "mujoco.MjSpec", cfg) -> None:
-    """Best-effort: add a shared fractal heightfield and replace the floor.
-
-    Caveat: MJX hfield collision support depends on your mujoco version. If this
-    raises on your stack, keep `env.terrain="scene"`.
-    """
-    size = 256
-    hf = fractal_heightfield(
-        size=size,
-        octaves=cfg.fractal_octaves,
-        lacunarity=cfg.fractal_lacunarity,
-        gain=cfg.fractal_gain,
-        z_scale=cfg.fractal_z_scale,
-        seed=0,
-    )
-    spec.add_hfield(
-        name="rma_terrain",
-        size=[10.0, 10.0, cfg.fractal_z_scale, 0.1],
-        nrow=size,
-        ncol=size,
-        userdata=hf.flatten().tolist(),
-    )
-    for g in list(spec.worldbody.geoms):
-        if g.type == mujoco.mjtGeom.mjGEOM_PLANE:
-            spec.delete(g)
-    spec.worldbody.add_geom(
-        name="rma_terrain_geom",
-        type=mujoco.mjtGeom.mjGEOM_HFIELD,
-        hfieldname="rma_terrain",
-        pos=[0, 0, 0],
-    )
-
-
 def _has_floor(spec: "mujoco.MjSpec") -> bool:
     return any(g.type == mujoco.mjtGeom.mjGEOM_PLANE
                for g in spec.worldbody.geoms)
 
 
 def _add_floor(spec: "mujoco.MjSpec") -> None:
-    spec.worldbody.add_geom(
-        name="rma_floor",
-        type=mujoco.mjtGeom.mjGEOM_PLANE,
-        size=[0.0, 0.0, 0.05],
-        pos=[0, 0, 0],
-    )
+    spec.worldbody.add_geom(name="rma_floor", type=mujoco.mjtGeom.mjGEOM_PLANE,
+                            size=[0.0, 0.0, 0.05], pos=[0, 0, 0])
+
+
+def _add_heightfield(spec: "mujoco.MjSpec", cfg) -> None:
+    """Replace the floor with one shared fractal heightfield.
+
+    A single hfield (1 geom) is the MJX-efficient way to train on uneven terrain;
+    per-env terrain variety comes from randomized spawn positions, not per-env
+    fields (the model is shared across the vmapped batch).
+    """
+    n, r = cfg.hfield_grid, cfg.hfield_radius
+    hf = fractal_heightfield(size=n, octaves=cfg.fractal_octaves,
+                             lacunarity=cfg.fractal_lacunarity, gain=cfg.fractal_gain,
+                             base_frequency=cfg.fractal_base_freq, seed=0)
+    spec.add_hfield(name="rma_terrain", size=[r, r, cfg.fractal_z_scale, 0.1],
+                    nrow=n, ncol=n, userdata=hf.flatten().tolist())
+    for g in list(spec.worldbody.geoms):
+        if g.type == mujoco.mjtGeom.mjGEOM_PLANE:
+            spec.delete(g)
+    spec.worldbody.add_geom(name="rma_terrain_geom", type=mujoco.mjtGeom.mjGEOM_HFIELD,
+                            hfieldname="rma_terrain", pos=[0, 0, 0])
 
 
 def build_model(cfg, model_path: str) -> mujoco.MjModel:
-    # "auto"/None -> the Go2 model bundled inside the gym-quadruped package, so
-    # training uses the exact model the grader evaluates on.
+    # "auto"/None -> the Go2 bundled in gym-quadruped, so training and the grader
+    # share the exact same model.
     model_path = resolve_model_path(model_path)
     if not os.path.exists(model_path):
         raise FileNotFoundError(
             f"Model not found at {model_path}. For the default (gym-quadruped "
-            f"bundled Go2) just `pip install gym-quadruped`."
-        )
+            f"bundled Go2) just `pip install gym-quadruped`.")
     spec = mujoco.MjSpec.from_file(model_path)
 
     _strip_sensors(spec)
-
     if cfg.terrain == "hfield":
         _add_heightfield(spec, cfg)
     elif not _has_floor(spec):
-        # Bare robot MJCF (e.g. gym-quadruped's go2.xml) has no ground; add one.
-        _add_floor(spec)
+        _add_floor(spec)                       # bare robot MJCF has no ground
 
-    # Stable physics for MJX: Newton solver, small timestep.
     spec.option.timestep = cfg.physics_dt
-    try:
+    try:                                       # stable MJX contact: Newton solver
         spec.option.solver = mujoco.mjtSolver.mjSOL_NEWTON
         spec.option.iterations = 4
         spec.option.ls_iterations = 8
@@ -182,11 +112,5 @@ def build_model(cfg, model_path: str) -> mujoco.MjModel:
         pass
 
     model = spec.compile()
-    # Foot-only collisions: numerically stable in MJX (sphere<->plane only). Full
-    # robot<->floor collisions (see _robot_floor_collisions) are deployment-
-    # faithful but the stiff cylinder/box<->plane penetration of an untrained,
-    # exploring policy explodes contact forces -> NaN. We instead reproduce the
-    # grader's "non-foot body touches ground = fall" rule via a base-height
-    # termination (cfg.min_base_height), which keeps the trunk/thighs clear.
     _foot_only_collisions(model)
     return model

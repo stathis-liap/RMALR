@@ -1,9 +1,10 @@
 """Phase-1 PPO: jointly train base policy pi and env-factor encoder mu.
 
-Asymmetric actor-critic: the policy sees z_t = mu(e_t); the value function sees
-the raw privileged e_t. Trains on a vmapped batch of domain-randomized MJX envs.
-Follows the PPO settings in the paper + supplementary (clip 0.2, gamma 0.998,
-lambda 0.95, 4 epochs x 4 minibatches, lr 5e-4, value-coef 0.5, no entropy).
+Asymmetric actor-critic -- the policy sees z_t = mu(e_t), the value function sees
+the raw privileged e_t -- on a vmapped batch of domain-randomized MJX envs. PPO
+settings follow the paper/supplementary (clip 0.2, GAE lambda 0.95, 4 epochs x
+4 minibatches, lr 5e-4, value-coef 0.5), plus a small entropy bonus that keeps
+the policy exploring (see config.PPOConfig.entropy_coef).
 """
 from __future__ import annotations
 
