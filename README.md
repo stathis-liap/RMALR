@@ -79,7 +79,7 @@ Dockerfile               # GPU training image (self-contained)
 Server location used below (edit to taste):
 
 ```bash
-SERVER=username@[ip]     # the GPU training host
+SERVER=stathisliap@150.140.184.61      # the GPU training host
 REMOTE=~/rmalr                          # project dir on the server
 ```
 

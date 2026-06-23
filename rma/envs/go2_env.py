@@ -135,6 +135,10 @@ class Go2Env:
         self.foot_geom_ids = jnp.asarray(self.layout.foot_geom_ids)
         # hip (abduction) joints are the 1st of each leg's [hip,thigh,calf] triple
         self.hip_indices = jnp.asarray([0, 3, 6, 9])
+        # trunk center + 4 footprint corners (m), to spawn clear of the highest
+        # ground under the robot so no foot starts buried in the heightfield.
+        self._footprint = jnp.array([[0.0, 0.0], [0.25, 0.18], [0.25, -0.18],
+                                     [-0.25, 0.18], [-0.25, -0.18]])
 
         self._load_terrain()
 
@@ -221,11 +225,13 @@ class Go2Env:
         # terrain; drop in just above the ground at that point.
         xy = jax.random.uniform(k8, (2,), minval=-ecfg.reset_xy_range,
                                 maxval=ecfg.reset_xy_range)
-        terrain_h = self._terrain_height(xy)
+        terrain_h = self._terrain_height(xy)            # under the trunk (-> e_t)
+        # spawn above the HIGHEST ground in the footprint so no foot starts buried
+        spawn_terrain = jnp.max(self._terrain_height(xy[None, :] + self._footprint))
 
         qpos = self.init_qpos
         qpos = qpos.at[0:2].set(xy)
-        qpos = qpos.at[2].set(terrain_h + INIT_BASE_HEIGHT + ecfg.reset_drop_height)
+        qpos = qpos.at[2].set(spawn_terrain + INIT_BASE_HEIGHT + ecfg.reset_drop_height)
         qpos = qpos.at[self.qpos_adr].add(jp)
         qpos = qpos.at[3:7].set(_rp_to_quat(rp[0], rp[1]))
         qvel = self.init_qvel.at[self.qvel_adr].add(jv)

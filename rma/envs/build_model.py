@@ -83,8 +83,19 @@ def _add_heightfield(spec: "mujoco.MjSpec", cfg) -> None:
     for g in list(spec.worldbody.geoms):
         if g.type == mujoco.mjtGeom.mjGEOM_PLANE:
             spec.delete(g)
-    spec.worldbody.add_geom(name="rma_terrain_geom", type=mujoco.mjtGeom.mjGEOM_HFIELD,
-                            hfieldname="rma_terrain", pos=[0, 0, 0])
+    # Checker material + a light so the (gentle) surface reads as terrain when
+    # rendered -- visual only, ignored by MJX physics.
+    spec.add_texture(name="rma_grid", type=mujoco.mjtTexture.mjTEXTURE_2D,
+                     builtin=mujoco.mjtBuiltin.mjBUILTIN_CHECKER, width=512, height=512,
+                     rgb1=[0.25, 0.32, 0.40], rgb2=[0.35, 0.42, 0.50])
+    mat = spec.add_material(name="rma_grid", texrepeat=[40, 40], texuniform=True)
+    mat.textures[mujoco.mjtTextureRole.mjTEXROLE_RGB] = "rma_grid"
+    spec.worldbody.add_light(pos=[0, 0, 5], dir=[0, 0, -1],
+                             type=mujoco.mjtLightType.mjLIGHT_DIRECTIONAL)
+    geom = spec.worldbody.add_geom(name="rma_terrain_geom",
+                                   type=mujoco.mjtGeom.mjGEOM_HFIELD,
+                                   hfieldname="rma_terrain", pos=[0, 0, 0])
+    geom.material = "rma_grid"
 
 
 def build_model(cfg, model_path: str) -> mujoco.MjModel:

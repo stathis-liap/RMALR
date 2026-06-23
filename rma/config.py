@@ -40,7 +40,7 @@ class EnvConfig:
     reset_joint_pos_noise: float = 0.30   # rad
     reset_joint_vel_noise: float = 0.50   # rad/s
     reset_rp_noise: float = 0.15          # rad, roll & pitch
-    reset_drop_height: float = 0.03       # m, spawn clearance above the ground
+    reset_drop_height: float = 0.06       # m, spawn clearance above the ground
     reset_xy_range: float = 4.0           # m, random spawn xy (terrain variety)
 
     # Goal-conditioned velocity command g_t = [vx, vy, yaw_rate], base frame. Full

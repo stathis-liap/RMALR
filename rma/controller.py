@@ -80,7 +80,10 @@ class Controller:
             500 Hz; the policy was trained at 50 Hz, so the default (from cfg)
             holds each residual target for 10 env steps while the PD torque is
             recomputed every step. Set to 1 if you call act() at the policy rate.
-        mode: 'rma' (phi estimates z_hat), or 'no_adapt' (z = mu(0)).
+        mode: 'rma' (phi estimates z_hat from history), 'no_adapt' (z = mu(0),
+            the lower bound), or 'expert' (z = mu(e_t) from the sim's true
+            privileged factors, the upper bound -- call set_privileged(e_t) each
+            episode to supply e_t).
         """
         self.cfg = cfg or Config()
         self.kp = float(kp)
@@ -104,6 +107,14 @@ class Controller:
         self._enc_params = p1["encoder"]
         self._pol_params = p1["policy"]
 
+        # mu is always available: no_adapt uses mu(0); expert uses mu(e_t) with
+        # the sim's true env factors, supplied per episode via set_privileged().
+        @jax.jit
+        def _mu(e):
+            return encoder.apply(self._enc_params, e)
+
+        self._mu = _mu
+
         if mode == "rma":
             if not phase2_ckpt:
                 raise ValueError("mode='rma' requires a phase2 checkpoint")
@@ -114,9 +125,9 @@ class Controller:
                 return adapt.apply(self._phi_params, history)
 
             self._phi = _phi
-        else:  # no_adapt: z = mu(0)
-            zero_e = jnp.zeros((self.cfg.net.env_factor_dim,))
-            self._z_fixed = np.asarray(encoder.apply(self._enc_params, zero_e))
+        else:  # no_adapt (z = mu(0)) or expert (z = mu(e_t), set externally)
+            self._z_fixed = np.asarray(
+                self._mu(jnp.zeros((self.cfg.net.env_factor_dim,))))
 
         @jax.jit
         def _policy_mean(x, a_prev, z):
@@ -135,6 +146,12 @@ class Controller:
         self._z_async = None
         self._step = 0                        # env-step counter
         self._policy_updates = 0
+
+    # ------------------------------------------------------------- expert mode
+    def set_privileged(self, e_t):
+        """Expert/oracle upper bound: set z = mu(e_t) from the sim's true env
+        factors (17-dim, same layout as training). Call once per episode."""
+        self._z_fixed = np.asarray(self._mu(jnp.asarray(e_t, dtype=jnp.float32)))
 
     # ------------------------------------------------------------------- act
     def _build_x(self, obs: dict) -> np.ndarray:
