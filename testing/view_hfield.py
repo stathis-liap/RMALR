@@ -50,6 +50,9 @@ class HfieldRunner:
             lambda st, z: pol.apply(p1["policy"], st.obs, st.prev_action, z)[0])
         self._mu = jax.jit(lambda e: enc.apply(p1["encoder"], e))
         self._phi = jax.jit(lambda st: adapt.apply(phi, st.history)) if phi else None
+        # no_adapt: constant mu(e_nominal) for the default robot (not mu(0)).
+        e_nominal = self.env._privileged(model, jnp.ones(12), jnp.zeros(()))
+        self._z_nominal = self._mu(e_nominal)
 
         self.rng = jax.random.PRNGKey(seed)
         self._respawn()
@@ -59,7 +62,7 @@ class HfieldRunner:
             return self._phi(self.state)
         if self.mode == "expert":               # true e_t (incl. real terrain h)
             return self._mu(self.state.e)
-        return self._mu(jnp.zeros((self.edim,)))  # no_adapt: mu(0)
+        return self._z_nominal                  # no_adapt: mu(e_nominal)
 
     def _respawn(self):
         self.rng, k = jax.random.split(self.rng)

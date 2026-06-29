@@ -95,7 +95,7 @@ def make_env(scene: str, friction=(0.4, 1.2), payload: float = 0.0):
     friction: ground friction range (lo, hi) sampled per episode. Pass (f, f) to
         pin a fixed friction for a domain-shift sweep.
     payload: kg added to the trunk body (0 = nominal). Tests load adaptation --
-        the regime where RMA's phi should beat the fixed mu(0) of no_adapt.
+        the regime where RMA phi should beat the fixed mu(e_nominal) of no_adapt.
     """
     imu_kwargs = {"accel_name": "imu_acc", "gyro_name": "imu_gyro",
                   "imu_site_name": "imu"}

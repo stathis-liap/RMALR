@@ -34,8 +34,22 @@ from .config import Config
 from .models import networks
 from .envs.go2_constants import (
     NOMINAL_POSE, TORQUE_LIMIT, ctrl_from_qpos_permutation, resolve_model_path,
+    resolve_layout,
 )
 from .utils import load_pytree
+
+
+def _nominal_privileged(model_path):
+    """Nominal e_t (17-dim) for the DEFAULT robot -- what no_adapt assumes:
+    base trunk mass, base COM, motor strength 1.0, base foot friction, flat ground.
+    Layout matches training (go2_env._privileged)."""
+    m = mujoco.MjModel.from_xml_path(resolve_model_path(model_path))
+    layout = resolve_layout(m)
+    payload = float(m.body_mass[layout.trunk_body_id])
+    com = np.asarray(m.body_ipos[layout.trunk_body_id, :2], dtype=np.float32)
+    friction = float(m.geom_friction[layout.foot_geom_ids[0], 0])
+    return np.concatenate([[payload], com, np.ones(12, np.float32),
+                           [friction], [0.0]]).astype(np.float32)
 
 
 def _ctrl_permutation(model_path):
@@ -80,7 +94,7 @@ class Controller:
             500 Hz; the policy was trained at 50 Hz, so the default (from cfg)
             holds each residual target for 10 env steps while the PD torque is
             recomputed every step. Set to 1 if you call act() at the policy rate.
-        mode: 'rma' (phi estimates z_hat from history), 'no_adapt' (z = mu(0),
+        mode: 'rma' (phi estimates z_hat from history), 'no_adapt' (z = mu(e_nominal),
             the lower bound), or 'expert' (z = mu(e_t) from the sim's true
             privileged factors, the upper bound -- call set_privileged(e_t) each
             episode to supply e_t).
@@ -107,7 +121,7 @@ class Controller:
         self._enc_params = p1["encoder"]
         self._pol_params = p1["policy"]
 
-        # mu is always available: no_adapt uses mu(0); expert uses mu(e_t) with
+        # mu is always available: no_adapt uses mu(e_nominal); expert uses mu(e_t) with
         # the sim's true env factors, supplied per episode via set_privileged().
         @jax.jit
         def _mu(e):
@@ -125,9 +139,10 @@ class Controller:
                 return adapt.apply(self._phi_params, history)
 
             self._phi = _phi
-        else:  # no_adapt (z = mu(0)) or expert (z = mu(e_t), set externally)
-            self._z_fixed = np.asarray(
-                self._mu(jnp.zeros((self.cfg.net.env_factor_dim,))))
+        else:  # no_adapt (z = mu(e_nominal)) or expert (z = mu(e_t), set externally)
+            # no_adapt assumes the DEFAULT robot and never changes z.
+            e_nom = _nominal_privileged(self.cfg.model_path)
+            self._z_fixed = np.asarray(self._mu(jnp.asarray(e_nom)))
 
         @jax.jit
         def _policy_mean(x, a_prev, z):

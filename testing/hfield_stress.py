@@ -52,11 +52,16 @@ def run_scenario_hfield(sc, phase1, phase2, mode, n_envs, max_steps, seed, z_sca
     v_reset = jax.vmap(env.reset, in_axes=(in_axes, 0))
     v_step = jax.vmap(env.step, in_axes=(in_axes, 0, 0, None))
 
+    # no_adapt: constant z = mu(e_nominal) (default robot), not mu(0).
+    e_nominal = env._privileged(env.mjx_model, jnp.ones(cfg.net.action_dim),
+                                jnp.zeros(()))
+    z_nominal = enc.apply(p1["encoder"], e_nominal)
+
     def get_z(state):
         if mode == "expert":
             return enc.apply(p1["encoder"], state.e)
         if mode == "no_adapt":
-            return enc.apply(p1["encoder"], jnp.zeros_like(state.e))
+            return jnp.broadcast_to(z_nominal, state.e.shape[:-1] + z_nominal.shape)
         return adapt.apply(phi, state.history)
 
     @jax.jit

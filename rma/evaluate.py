@@ -11,7 +11,7 @@ runs inside gym-quadruped -- use ``python -m rma.eval_gym`` for that.
 Modes:
   rma       -> z_hat = phi(history), refreshed every 10 steps (default)
   expert    -> z = mu(e)  (privileged upper bound)
-  no_adapt  -> z = mu(0)  (base policy, adaptation disabled)
+  no_adapt  -> z = mu(e_nominal)  (assumes the default robot; lower bound)
 
 Usage:
   python -m rma.evaluate --phase1 ckpt/phase1_final.pkl \
@@ -44,11 +44,19 @@ def evaluate(cfg, model_path, phase1_ckpt, phase2_ckpt, mode, num_envs, seed):
 
     async_every = 10  # phi at 1/10 of control rate
 
+    # no_adapt: constant z = mu(e_nominal) for the DEFAULT robot (nominal mass,
+    # no COM shift, motor strength 1, base friction, flat ground) -- the policy
+    # "assumes the robot is as it should be", not mu(0) (an out-of-distribution
+    # zero-friction/zero-motor input the encoder never saw).
+    e_nominal = env._privileged(env.mjx_model, jnp.ones(cfg.net.action_dim),
+                                jnp.zeros(()))
+    z_nominal = encoder.apply(p1["encoder"], e_nominal)
+
     def get_z(state):
         if mode == "expert":
             return encoder.apply(p1["encoder"], state.e)
         if mode == "no_adapt":
-            return encoder.apply(p1["encoder"], jnp.zeros_like(state.e))
+            return jnp.broadcast_to(z_nominal, state.e.shape[:-1] + z_nominal.shape)
         return adapt.apply(phi, state.history)  # rma
 
     state = v_reset(batched_model, jax.random.split(k_reset, num_envs))
